@@ -44,7 +44,7 @@ class WorkspaceBoundary:
     ) -> None:
         self.root = Path(repo_path).resolve()
         self._confirm_callback = confirm_callback
-        self._allowed_outside: set[Path] = set()
+        self._allowed_outside: set[Path] = set() # 用于记录已经被用户手动允许过的“越界路径”。这样同一个越界路径在同一个会话中只需要确认一次，避免反复弹窗打扰用户。
 
     def resolve(
         self,

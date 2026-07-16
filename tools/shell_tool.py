@@ -327,7 +327,7 @@ def terminal_confirm(cmd: str) -> bool:
     """
     import sys
 
-    # 判断是否在交互式终端
+    # 判断是否在交互式终端（检测标准输入（stdin）是否连接到了一个真实的终端）
     if not sys.stdin.isatty():
         # 非交互式（pipe / CI）：默认拒绝，避免意外执行
         print(f"\n[confirm] Non-interactive terminal, rejecting: {cmd!r}", flush=True)

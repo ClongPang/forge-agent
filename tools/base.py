@@ -127,7 +127,7 @@ class ToolRegistry:
         self._tools[tool.name] = tool
         return self
 
-    def execute_tool(self, name: str, params: dict[str, Any]) -> ToolResult:
+    def execute_tool(self, name: str, params: Any) -> ToolResult:
         """
         按名称查找工具并执行。
         工具不存在时返回 error ToolResult（不抛异常，让 agent 继续运行）。
@@ -141,6 +141,14 @@ class ToolRegistry:
             )
 
         tool = self._tools[name]
+        validation_error = _validate_params(tool.parameters_schema, params)
+        if validation_error:
+            return ToolResult(
+                success=False,
+                output="",
+                error=f"Invalid params for {name}: {validation_error}",
+            )
+
         try:
             return tool.execute(params)
         except Exception as exc:
@@ -167,6 +175,78 @@ class ToolRegistry:
 
     def __repr__(self) -> str:
         return f"ToolRegistry(tools={self.tool_names})"
+
+
+# ---------------------------------------------------------------------------
+# 参数 schema 校验
+# ---------------------------------------------------------------------------
+
+def _validate_params(schema: dict[str, Any], params: Any) -> str | None:
+    """
+    校验 LLM 返回的工具参数。
+
+    只实现项目当前工具 schema 使用到的 JSON Schema 子集：
+    object / string / integer / boolean / array / required / properties / items。
+    返回 None 表示通过，返回字符串表示错误原因。
+    """
+    return _validate_value(schema, params, path="params")
+
+
+def _validate_value(schema: dict[str, Any], value: Any, path: str) -> str | None:
+    expected_type = schema.get("type")
+
+    if expected_type == "object":
+        if not isinstance(value, dict):
+            return f"{path} must be object"
+
+        properties = schema.get("properties", {})
+        allow_extra = schema.get("additionalProperties") is True
+
+        if not allow_extra:
+            for key in value:
+                if key not in properties:
+                    return f"unknown property '{key}'"
+
+        for key in schema.get("required", []):
+            if key not in value:
+                return f"missing required property '{key}'"
+
+        for key, child_schema in properties.items():
+            if key not in value:
+                continue
+            error = _validate_value(child_schema, value[key], path=key)
+            if error:
+                return error
+        return None
+
+    if expected_type == "string":
+        if not isinstance(value, str):
+            return f"{path} must be string"
+        return None
+
+    if expected_type == "integer":
+        if not isinstance(value, int) or isinstance(value, bool):
+            return f"{path} must be integer"
+        return None
+
+    if expected_type == "boolean":
+        if not isinstance(value, bool):
+            return f"{path} must be boolean"
+        return None
+
+    if expected_type == "array":
+        if not isinstance(value, list):
+            return f"{path} must be array"
+        item_schema = schema.get("items")
+        if isinstance(item_schema, dict):
+            for index, item in enumerate(value):
+                error = _validate_value(item_schema, item, path=f"{path}[{index}]")
+                if error:
+                    return error
+        return None
+
+    # 未使用到的 schema 关键字不在 v1 中强行解释，避免误伤未来扩展。
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -201,6 +281,7 @@ class NoopTool(BaseTool):
                 "input": {"type": "string", "description": "Anything"},
             },
             "required": [],
+            "additionalProperties": True,
         }
 
     def execute(self, params: dict[str, Any]) -> ToolResult:

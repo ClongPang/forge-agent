@@ -83,11 +83,36 @@ def make_give_up_action(message="Cannot solve.") -> Action:
     )
 
 
+class SchemaTool(NoopTool):
+    """测试专用：用自定义 schema 覆盖 NoopTool 的宽松参数定义。"""
+
+    def __init__(self, schema: dict, tool_name: str = "schema_tool") -> None:
+        super().__init__(tool_name, output="validated")
+        self._schema = schema
+
+    @property
+    def parameters_schema(self) -> dict:
+        return self._schema
+
+
 # ---------------------------------------------------------------------------
 # ToolRegistry
 # ---------------------------------------------------------------------------
 
 class TestToolRegistry:
+    def _make_param_tool(self) -> SchemaTool:
+        return SchemaTool({
+            "type": "object",
+            "properties": {
+                "cmd": {"type": "string"},
+                "timeout": {"type": "integer"},
+                "dry_run": {"type": "boolean"},
+                "paths": {"type": "array", "items": {"type": "string"}},
+                "meta": {"type": "object"},
+            },
+            "required": ["cmd"],
+        })
+
     def test_register_and_execute(self):
         tool = NoopTool("mytool", output="hello")
         registry = ToolRegistry()
@@ -143,6 +168,105 @@ class TestToolRegistry:
         result = registry.execute_tool("broken", {})
         assert not result.success
         assert "disk full" in result.error
+
+    def test_schema_validation_allows_valid_params(self):
+        tool = self._make_param_tool()
+        registry = ToolRegistry().register(tool)
+
+        result = registry.execute_tool("schema_tool", {
+            "cmd": "pytest",
+            "timeout": 30,
+            "dry_run": False,
+            "paths": ["tests/test_day2.py"],
+            "meta": {},
+        })
+
+        assert result.success
+        assert tool.call_count == 1
+
+    def test_schema_validation_rejects_missing_required_param(self):
+        tool = self._make_param_tool()
+        registry = ToolRegistry().register(tool)
+
+        result = registry.execute_tool("schema_tool", {})
+
+        assert not result.success
+        assert result.error.startswith("Invalid params for schema_tool")
+        assert "missing required property 'cmd'" in result.error
+        assert tool.call_count == 0
+
+    @pytest.mark.parametrize(
+        ("params", "message"),
+        [
+            ({"cmd": 123}, "cmd must be string"),
+            ({"cmd": "pytest", "timeout": "30"}, "timeout must be integer"),
+            ({"cmd": "pytest", "timeout": True}, "timeout must be integer"),
+            ({"cmd": "pytest", "dry_run": "false"}, "dry_run must be boolean"),
+            ({"cmd": "pytest", "paths": "tests/"}, "paths must be array"),
+            ({"cmd": "pytest", "paths": ["tests/", 123]}, "paths[1] must be string"),
+            ({"cmd": "pytest", "meta": "not-object"}, "meta must be object"),
+        ],
+    )
+    def test_schema_validation_rejects_type_errors(self, params, message):
+        tool = self._make_param_tool()
+        registry = ToolRegistry().register(tool)
+
+        result = registry.execute_tool("schema_tool", params)
+
+        assert not result.success
+        assert result.error.startswith("Invalid params for schema_tool")
+        assert message in result.error
+        assert tool.call_count == 0
+
+    @pytest.mark.parametrize("params", [None, [], "cmd=pytest"])
+    def test_schema_validation_rejects_non_object_params(self, params):
+        tool = self._make_param_tool()
+        registry = ToolRegistry().register(tool)
+
+        result = registry.execute_tool("schema_tool", params)
+
+        assert not result.success
+        assert "Invalid params for schema_tool" in result.error
+        assert "params must be object" in result.error
+        assert tool.call_count == 0
+
+    def test_schema_validation_rejects_unknown_params(self):
+        tool = self._make_param_tool()
+        registry = ToolRegistry().register(tool)
+
+        result = registry.execute_tool("schema_tool", {
+            "cmd": "pytest",
+            "raw": "bad json",
+        })
+
+        assert not result.success
+        assert "unknown property 'raw'" in result.error
+        assert tool.call_count == 0
+
+    def test_invalid_tool_params_become_observation_error(self, task, log):
+        """参数解析失败产生的 raw 字段会在 registry 层变成 observation。"""
+        tool = SchemaTool({
+            "type": "object",
+            "properties": {"cmd": {"type": "string"}},
+            "required": ["cmd"],
+        }, tool_name="shell")
+        registry = ToolRegistry().register(tool)
+        backend = MockBackend([
+            make_tool_call_action("shell", {"raw": "{bad json"}),
+            make_finish_action(),
+        ])
+        agent = Agent(backend, registry)
+
+        result = agent.run(task, log)
+
+        assert result.status == RunStatus.SUCCESS
+        assert tool.call_count == 0
+        obs_events = [e for e in log.replay() if e.event_type.value == "observation"]
+        assert obs_events
+        obs = obs_events[0].payload["observation"]
+        assert obs["status"] == "error"
+        assert "Invalid params for shell" in obs["error"]
+        assert "unknown property 'raw'" in obs["error"]
 
 
 # ---------------------------------------------------------------------------

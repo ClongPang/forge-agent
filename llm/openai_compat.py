@@ -435,16 +435,11 @@ def _stream_with_tools(self, api_messages, tools, on_text, on_thought=None):
                     tool_calls_raw[idx]["arguments"] += tc_delta.function.arguments
 
     # 构造 mock choice 供 _parse_openai_response 复用
-    import json as _json
     from types import SimpleNamespace
 
     if tool_calls_raw and finish_reason == "tool_calls":
         tcs = []
         for tc in tool_calls_raw:
-            try:
-                params = _json.loads(tc["arguments"])
-            except Exception:
-                params = {"raw": tc["arguments"]}
             fn = SimpleNamespace(name=tc["name"], arguments=tc["arguments"])
             tcs.append(SimpleNamespace(function=fn))
         mock_message = SimpleNamespace(content=full_text or None, tool_calls=tcs)

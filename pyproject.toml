@@ -34,7 +34,7 @@ full = [
 ]
 
 [project.scripts]
-agent = "entry.cli:main"
+forgeagent = "entry.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

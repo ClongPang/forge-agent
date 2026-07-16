@@ -308,6 +308,10 @@ class TestOpenAICompatBackend:
         fn = SimpleNamespace(name=name, arguments=json.dumps(args_dict))
         return SimpleNamespace(function=fn)
 
+    def _make_tool_call_raw(self, name, arguments):
+        fn = SimpleNamespace(name=name, arguments=arguments)
+        return SimpleNamespace(function=fn)
+
     def _make_backend(self, model="gpt-4o"):
         with patch("openai.OpenAI"):
             from llm.openai_compat import OpenAICompatBackend
@@ -327,6 +331,20 @@ class TestOpenAICompatBackend:
         assert result.action.action_type == ActionType.TOOL_CALL
         assert result.action.tool_call.name == "shell"
         assert result.action.tool_call.params == {"cmd": "pytest"}
+
+    def test_invalid_tool_arguments_become_raw_params(self):
+        backend = self._make_backend()
+        response = self._make_response(
+            "tool_calls",
+            content="Let me run the tests.",
+            tool_calls=[self._make_tool_call_raw("shell", "{bad json")],
+        )
+        backend._client.chat.completions.create.return_value = response
+
+        result = backend.complete(make_messages("user", "fix it"), [make_tool_schema()])
+        assert result.action.action_type == ActionType.TOOL_CALL
+        assert result.action.tool_call.name == "shell"
+        assert result.action.tool_call.params == {"raw": "{bad json"}
 
     def test_stop_response_is_finish(self):
         backend = self._make_backend()
@@ -399,6 +417,16 @@ class TestTextFallback:
         result = backend.complete(make_messages("user", "fix it"), [make_tool_schema()])
         assert result.action.action_type == ActionType.TOOL_CALL
         assert result.action.tool_call.name == "shell"
+
+    def test_non_object_text_params_fall_back_to_empty_params(self):
+        backend = self._make_backend()
+        text = '```json\n{"tool": "shell", "params": "pytest"}\n```'
+        backend._client.chat.completions.create.return_value = self._make_response(text)
+
+        result = backend.complete(make_messages("user", "fix it"), [make_tool_schema()])
+        assert result.action.action_type == ActionType.TOOL_CALL
+        assert result.action.tool_call.name == "shell"
+        assert result.action.tool_call.params == {}
 
     def test_task_complete_keyword(self):
         backend = self._make_backend()

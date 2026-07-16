@@ -262,7 +262,8 @@ class ChatSession:
 
         # 把共享 history 注入 agent（替换它内部的 history）
         # 通过 monkey-patch _shared_history 实现跨轮续接
-        self.agent._shared_history = self._shared_history
+        # 共享 history 会在 _run_injecting_history() 中通过 _pending_history 注入 agent
+        # self.agent._shared_history = self._shared_history
 
         t0 = time.time()
         with EventLog.create(task, log_dir=self.log_dir) as log:
