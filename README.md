@@ -149,10 +149,11 @@ coding-agent/
 **流式输出**
 模型 thought 逐 token 实时打印，工具调用实时显示，体验接近 Claude Code。
 
-**安全机制（三层）**
+**安全机制（四层）**
 - 硬拦截黑名单：`rm -rf /`、`mkfs` 等永不执行
+- 工作区边界：文件、搜索、测试、git 和可识别 shell 路径默认限制在 repo 内
 - 只读白名单：`ls`、`grep`、`git status`、`pytest` 等直接执行
-- 写操作确认：`--confirm` 模式下 `git commit`、`pip install` 等需 y/n 确认
+- 外部路径/写操作确认：`--confirm` 或 chat 模式下需 y/n 确认；非交互默认拒绝
 
 **Docker 沙箱**
 `--sandbox` 参数，所有命令在 `python:3.11-slim` 容器里执行，
@@ -171,7 +172,8 @@ repo 通过 bind mount 双向同步，默认断网。
 
 ## 安全说明
 
-`--confirm` 模式（`run`）和 `chat` 模式默认对写操作要求确认，执行前显示：
+`--confirm` 模式（`run`）和 `chat` 模式默认对写操作、网络请求、
+仓库外路径访问要求确认，执行前显示：
 
 ```
   ⚠  Agent wants to run:
@@ -179,6 +181,7 @@ repo 通过 bind mount 双向同步，默认断网。
   Allow? [y/N]
 ```
 
+不加 `--confirm` 的非交互 run/GitHub Issue 流程会拒绝仓库外路径访问。
 `--sandbox` 模式在 Docker 容器中执行，宿主机环境完全隔离。
 
 ---

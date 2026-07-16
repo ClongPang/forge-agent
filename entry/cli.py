@@ -62,29 +62,42 @@ def magenta(t: str) -> str: return _c(t, "35")
 # 构建 agent 各组件
 # ---------------------------------------------------------------------------
 
-def _build_registry(cfg, confirm_callback=None, runtime=None):
+def _build_registry(cfg, confirm_callback=None, runtime=None, repo_path=None):
     """根据配置组装工具注册表。"""
     from tools.base import ToolRegistry
     from tools.file_tool import FileReadTool, FileViewTool, FileWriteTool
     from tools.git_tool import GitAddTool, GitCommitTool, GitDiffTool, GitStatusTool
+    from tools.path_guard import WorkspaceBoundary
+    from tools.runtime import LocalRuntime
     from tools.search_tool import FindFilesTool, FindSymbolTool, SearchTextTool
     from tools.shell_tool import ShellTool
     from tools.test_tool import PytestTool
 
+    boundary = (
+        WorkspaceBoundary(repo_path, confirm_callback=confirm_callback)
+        if repo_path is not None else None
+    )
+    if runtime is None and boundary is not None:
+        runtime = LocalRuntime(boundary=boundary)
+
     return (
         ToolRegistry()
-        .register(ShellTool(confirm_callback=confirm_callback, runtime=runtime))
-        .register(FileReadTool())
-        .register(FileViewTool())
-        .register(FileWriteTool())
-        .register(SearchTextTool())
-        .register(FindFilesTool())
-        .register(FindSymbolTool())
-        .register(PytestTool(runtime=runtime))
-        .register(GitStatusTool(runtime=runtime))
-        .register(GitDiffTool(runtime=runtime))
-        .register(GitAddTool(runtime=runtime))
-        .register(GitCommitTool(runtime=runtime))
+        .register(ShellTool(
+            confirm_callback=confirm_callback,
+            runtime=runtime,
+            boundary=boundary,
+        ))
+        .register(FileReadTool(boundary=boundary))
+        .register(FileViewTool(boundary=boundary))
+        .register(FileWriteTool(boundary=boundary))
+        .register(SearchTextTool(boundary=boundary))
+        .register(FindFilesTool(boundary=boundary))
+        .register(FindSymbolTool(boundary=boundary))
+        .register(PytestTool(runtime=runtime, boundary=boundary))
+        .register(GitStatusTool(runtime=runtime, boundary=boundary))
+        .register(GitDiffTool(runtime=runtime, boundary=boundary))
+        .register(GitAddTool(runtime=runtime, boundary=boundary))
+        .register(GitCommitTool(runtime=runtime, boundary=boundary))
     )
 
 
@@ -240,7 +253,12 @@ def run(
     runtime = create_runtime(sandbox=sandbox, repo_path=str(repo_path)) if sandbox else None
     if sandbox:
         click.echo(dim(f"  Sandbox: Docker ({runtime.name})"))
-    registry = _build_registry(config, confirm_callback=confirm_cb, runtime=runtime)
+    registry = _build_registry(
+        config,
+        confirm_callback=confirm_cb,
+        runtime=runtime,
+        repo_path=str(repo_path),
+    )
 
     from agent.core import Agent, AgentConfig
     from agent.event_log import EventLog, summarize_run
@@ -363,19 +381,25 @@ def chat(
         click.echo(red(f"Error: {e}"), err=True)
         sys.exit(1)
 
-    registry = _build_registry(config)
     from tools.shell_tool import terminal_confirm
     from tools.runtime import create_runtime
+    confirm_cb = terminal_confirm
     runtime = create_runtime(sandbox=sandbox, repo_path=str(repo_path)) if sandbox else None
     if sandbox:
         click.echo(dim(f"  Sandbox: Docker ({runtime.name})"))
+    registry = _build_registry(
+        config,
+        confirm_callback=confirm_cb,
+        runtime=runtime,
+        repo_path=str(repo_path),
+    )
     session = ChatSession(
         backend=backend,
         registry=registry,
         config=config,
         repo_path=str(repo_path),
         log_dir=config.agent.log_dir,
-        confirm_callback=terminal_confirm,   # chat 模式默认开启确认
+        confirm_callback=confirm_cb,   # chat 模式默认开启确认
     )
 
     # 欢迎信息

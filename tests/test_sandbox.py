@@ -298,6 +298,33 @@ class TestDockerRuntimeUnit:
         container_cwd = docker_exec_call[workdir_idx + 1]
         assert container_cwd == f"{CONTAINER_WORKDIR}/src/module"
 
+    def test_cwd_translation_does_not_use_string_prefix(self, tmp_path):
+        """repo sibling with a common prefix must not translate into /workspace."""
+        repo = tmp_path / "repo"
+        sibling = tmp_path / "repo2"
+        repo.mkdir()
+        sibling.mkdir()
+        rt = DockerRuntime(repo_path=str(repo))
+        rt._container_id = "fake-container-id"
+
+        exec_calls = []
+
+        def mock_run(args, **kwargs):
+            exec_calls.append(args)
+            m = MagicMock()
+            m.returncode = 0
+            m.stdout = "ok"
+            m.stderr = ""
+            return m
+
+        with patch("subprocess.run", side_effect=mock_run):
+            rt.exec("ls", cwd=str(sibling))
+
+        docker_exec_call = next(a for a in exec_calls if "exec" in a)
+        workdir_idx = docker_exec_call.index("--workdir")
+        container_cwd = docker_exec_call[workdir_idx + 1]
+        assert container_cwd == str(sibling)
+
     def test_cleanup_removes_container(self, tmp_path):
         """cleanup() 应调用 docker rm -f。"""
         rt = self._make_runtime(tmp_path)

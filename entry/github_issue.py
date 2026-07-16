@@ -225,7 +225,7 @@ def run_on_issue(
         return 1
 
     from entry.cli import _build_registry
-    registry = _build_registry(config)
+    registry = _build_registry(config, repo_path=local_path)
 
     agent_config = AgentConfig(
         max_steps=config.agent.max_steps,

@@ -12,11 +12,12 @@ pytest 执行工具，返回结构化的测试结果。
 from __future__ import annotations
 
 import re
-import subprocess
+import shlex
 from pathlib import Path
 from typing import Any
 
 from tools.base import BaseTool, ToolResult
+from tools.path_guard import WorkspaceBoundary
 from tools.runtime import LocalRuntime, Runtime
 
 
@@ -34,8 +35,13 @@ class PytestTool(BaseTool):
         cwd (str):   工作目录（默认当前目录）
     """
 
-    def __init__(self, runtime: Runtime | None = None) -> None:
-        self._runtime = runtime or LocalRuntime()
+    def __init__(
+        self,
+        runtime: Runtime | None = None,
+        boundary: WorkspaceBoundary | None = None,
+    ) -> None:
+        self._boundary = boundary
+        self._runtime = runtime or LocalRuntime(boundary=boundary)
 
     @property
     def name(self) -> str:
@@ -72,7 +78,14 @@ class PytestTool(BaseTool):
 
     def execute(self, params: dict[str, Any]) -> ToolResult:
         cwd = params.get("cwd", None)
-        cwd_path = Path(cwd) if cwd else Path.cwd()
+        if self._boundary is not None:
+            cwd_check = self._boundary.resolve(cwd or ".", operation="run pytest in cwd")
+            if not cwd_check.success:
+                return ToolResult(success=False, output="", error=cwd_check.error)
+            cwd_path = cwd_check.path or self._boundary.root
+            cwd = str(cwd_path)
+        else:
+            cwd_path = Path(cwd) if cwd else Path.cwd()
 
         # 决定测试路径
         test_path = params.get("path", "")
@@ -81,8 +94,21 @@ class PytestTool(BaseTool):
                 test_path = "tests/"
             else:
                 test_path = "."
+        elif self._boundary is not None:
+            path_check = self._boundary.resolve(
+                test_path,
+                operation="run pytest path",
+                base=cwd_path,
+            )
+            if not path_check.success:
+                return ToolResult(success=False, output="", error=path_check.error)
+            test_path = _format_path_for_cwd(path_check.path or Path(test_path), cwd_path)
 
         extra_args = params.get("args", "")
+        try:
+            extra_parts = shlex.split(extra_args) if extra_args else []
+        except ValueError as e:
+            return ToolResult(success=False, output="", error=f"Invalid pytest args: {e}")
 
         # 组装命令：--tb=short 足够 agent 理解，--no-header 减少噪音
         cmd_parts = [
@@ -92,10 +118,9 @@ class PytestTool(BaseTool):
             "--no-header",
             "-q",               # 安静模式：只输出失败详情和最终统计
         ]
-        if extra_args:
-            cmd_parts.extend(extra_args.split())
+        cmd_parts.extend(extra_parts)
 
-        cmd_str = " ".join(cmd_parts)
+        cmd_str = shlex.join(cmd_parts)
         run_result = self._runtime.exec(cmd_str, cwd=cwd, timeout=PYTEST_TIMEOUT)
         if "timed out" in run_result.stderr.lower():
             return ToolResult(
@@ -114,6 +139,15 @@ class PytestTool(BaseTool):
             output=output,
             error=None if success else f"pytest exited with code {run_result.returncode}",
         )
+
+
+def _format_path_for_cwd(path: Path, cwd_path: Path) -> str:
+    """Use a cwd-relative path when possible."""
+    try:
+        rel = path.resolve(strict=False).relative_to(cwd_path.resolve(strict=False))
+    except ValueError:
+        return str(path)
+    return "." if str(rel) == "." else rel.as_posix()
 
 
 # ---------------------------------------------------------------------------

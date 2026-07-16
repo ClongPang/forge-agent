@@ -17,10 +17,11 @@ Shell 命令执行工具。四层防护：
 from __future__ import annotations
 
 import re
-import subprocess
+import shlex
 from typing import Any, Callable
 
 from tools.base import BaseTool, ToolResult
+from tools.path_guard import WorkspaceBoundary
 from tools.runtime import LocalRuntime, Runtime
 
 
@@ -114,9 +115,11 @@ class ShellTool(BaseTool):
         self,
         confirm_callback: ConfirmCallback | None = None,
         runtime: Runtime | None = None,
+        boundary: WorkspaceBoundary | None = None,
     ) -> None:
         self._confirm_callback = confirm_callback
-        self._runtime = runtime or LocalRuntime()
+        self._boundary = boundary
+        self._runtime = runtime or LocalRuntime(boundary=boundary)
 
     @property
     def name(self) -> str:
@@ -167,6 +170,10 @@ class ShellTool(BaseTool):
                 output="",
                 error=f"Command blocked for safety: matched '{blocked}'",
             )
+
+        outside_error = _check_outside_path_references(cmd, self._boundary)
+        if outside_error:
+            return ToolResult(success=False, output="", error=outside_error)
 
         # 层 2：白名单免确认
         if not _needs_confirm(cmd):
@@ -243,6 +250,51 @@ def _needs_confirm(cmd: str) -> bool:
         return False
     cmd_lower = cmd.lower()
     return any(kw in cmd_lower for kw in _CONFIRM_KEYWORDS)
+
+
+_PATH_CANDIDATE_RE = re.compile(
+    r"(?<![\w:])(/[^ \t\r\n'\";|&<>]+|(?:\.\./)[^ \t\r\n'\";|&<>]+)"
+)
+
+
+def _check_outside_path_references(
+    cmd: str,
+    boundary: WorkspaceBoundary | None,
+) -> str | None:
+    """Best-effort confirmation for explicit paths outside the workspace."""
+    if boundary is None:
+        return None
+
+    for candidate in _extract_path_candidates(cmd):
+        check = boundary.resolve(
+            candidate,
+            operation=f"shell command references {candidate!r}",
+        )
+        if not check.success:
+            return check.error
+    return None
+
+
+def _extract_path_candidates(cmd: str) -> list[str]:
+    """Extract absolute and parent-traversal path references from a shell string."""
+    candidates: set[str] = set()
+
+    try:
+        tokens = shlex.split(cmd, posix=True)
+    except ValueError:
+        tokens = []
+
+    for token in tokens:
+        parts = [token]
+        if "=" in token:
+            parts.append(token.split("=", 1)[1])
+        for part in parts:
+            cleaned = part.strip()
+            if cleaned.startswith(("/", "../")) or cleaned in {".."}:
+                candidates.add(cleaned)
+
+    candidates.update(m.group(1) for m in _PATH_CANDIDATE_RE.finditer(cmd))
+    return sorted(candidates)
 
 
 def _truncate(text: str, max_chars: int) -> str:

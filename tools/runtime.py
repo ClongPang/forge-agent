@@ -38,6 +38,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from tools.path_guard import WorkspaceBoundary
+
 logger = logging.getLogger(__name__)
 
 
@@ -118,6 +120,9 @@ class LocalRuntime(Runtime):
     行为和之前完全一致，是默认 runtime。
     """
 
+    def __init__(self, boundary: WorkspaceBoundary | None = None) -> None:
+        self._boundary = boundary
+
     @property
     def name(self) -> str:
         return "local"
@@ -128,6 +133,20 @@ class LocalRuntime(Runtime):
         cwd: str | None = None,
         timeout: int = 30,
     ) -> RunResult:
+        run_cwd = cwd
+        if self._boundary is not None:
+            if cwd is None:
+                run_cwd = str(self._boundary.root)
+            else:
+                check = self._boundary.resolve(cwd, operation="run command in cwd")
+                if not check.success:
+                    return RunResult(
+                        returncode=-1,
+                        stdout="",
+                        stderr=check.error or "cwd rejected by workspace boundary",
+                    )
+                run_cwd = str(check.path)
+
         try:
             proc = subprocess.run(
                 cmd,
@@ -135,7 +154,7 @@ class LocalRuntime(Runtime):
                 capture_output=True,
                 text=True,
                 timeout=timeout,
-                cwd=cwd,
+                cwd=run_cwd,
             )
             return RunResult(
                 returncode=proc.returncode,
@@ -190,7 +209,7 @@ class DockerRuntime(Runtime):
         extra_mounts: list[tuple[str, str]] | None = None,
         setup_cmds: list[str] | None = None,
     ) -> None:
-        self._repo_path = str(Path(repo_path).resolve())
+        self._repo_path = Path(repo_path).resolve()
         self._image = image
         self._extra_mounts = extra_mounts or []
         self._setup_cmds = setup_cmds or []
@@ -230,11 +249,20 @@ class DockerRuntime(Runtime):
         # 确定容器内工作目录
         if cwd:
             # 如果 cwd 是宿主机路径，转换为容器内路径
-            host_cwd = str(Path(cwd).resolve())
-            if host_cwd.startswith(self._repo_path):
-                relative = host_cwd[len(self._repo_path):].lstrip("/")
-                container_cwd = f"{CONTAINER_WORKDIR}/{relative}" if relative else CONTAINER_WORKDIR
-            else:
+            cwd_path = Path(cwd)
+            host_cwd = (
+                cwd_path.resolve()
+                if cwd_path.is_absolute()
+                else (self._repo_path / cwd_path).resolve()
+            )
+            try:
+                relative = host_cwd.relative_to(self._repo_path)
+                container_cwd = (
+                    CONTAINER_WORKDIR
+                    if str(relative) == "."
+                    else f"{CONTAINER_WORKDIR}/{relative.as_posix()}"
+                )
+            except ValueError:
                 container_cwd = cwd   # 可能是容器内的绝对路径
         else:
             container_cwd = CONTAINER_WORKDIR

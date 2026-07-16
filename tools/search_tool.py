@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from tools.base import BaseTool, ToolResult
+from tools.path_guard import WorkspaceBoundary
 
 
 MAX_RESULTS = 50        # 单次搜索最多返回的结果数
@@ -41,6 +42,9 @@ class SearchTextTool(BaseTool):
         file_pattern (str): 只搜索匹配的文件名（如 "*.py"，默认所有文件）
         case_sensitive (bool): 是否区分大小写（默认 True）
     """
+
+    def __init__(self, boundary: WorkspaceBoundary | None = None) -> None:
+        self._boundary = boundary
 
     @property
     def name(self) -> str:
@@ -81,7 +85,14 @@ class SearchTextTool(BaseTool):
 
     def execute(self, params: dict[str, Any]) -> ToolResult:
         raw_pattern = params.get("pattern", "")
-        search_path = Path(params.get("path", "."))
+        raw_path = params.get("path", ".")
+        search_path = Path(raw_path)
+        if self._boundary is not None:
+            check = self._boundary.resolve(raw_path, operation="search files")
+            if not check.success:
+                return ToolResult(success=False, output="", error=check.error)
+            search_path = check.path or search_path
+
         file_pattern = params.get("file_pattern", "*")
         case_sensitive = params.get("case_sensitive", True)
 
@@ -97,7 +108,12 @@ class SearchTextTool(BaseTool):
             )
 
         matches: list[str] = []
-        files = _iter_files(search_path, file_pattern)
+        files = _iter_files(
+            search_path,
+            file_pattern,
+            boundary=self._boundary,
+            skip_outside=self._boundary.is_inside(search_path) if self._boundary else False,
+        )
 
         for filepath in files:
             if len(matches) >= MAX_RESULTS:
@@ -139,6 +155,9 @@ class FindFilesTool(BaseTool):
         path (str):    搜索根目录（默认当前目录）
     """
 
+    def __init__(self, boundary: WorkspaceBoundary | None = None) -> None:
+        self._boundary = boundary
+
     @property
     def name(self) -> str:
         return "find_files"
@@ -170,7 +189,13 @@ class FindFilesTool(BaseTool):
 
     def execute(self, params: dict[str, Any]) -> ToolResult:
         pattern = params.get("pattern", "")
-        search_path = Path(params.get("path", "."))
+        raw_path = params.get("path", ".")
+        search_path = Path(raw_path)
+        if self._boundary is not None:
+            check = self._boundary.resolve(raw_path, operation="find files")
+            if not check.success:
+                return ToolResult(success=False, output="", error=check.error)
+            search_path = check.path or search_path
 
         if not search_path.exists():
             return ToolResult(
@@ -178,7 +203,12 @@ class FindFilesTool(BaseTool):
             )
 
         results: list[str] = []
-        for filepath in _iter_files(search_path, pattern):
+        for filepath in _iter_files(
+            search_path,
+            pattern,
+            boundary=self._boundary,
+            skip_outside=self._boundary.is_inside(search_path) if self._boundary else False,
+        ):
             results.append(str(filepath))
             if len(results) >= MAX_RESULTS:
                 break
@@ -208,6 +238,9 @@ class FindSymbolTool(BaseTool):
         symbol (str): 函数名或类名（支持部分匹配）
         path (str):   搜索根目录（默认当前目录）
     """
+
+    def __init__(self, boundary: WorkspaceBoundary | None = None) -> None:
+        self._boundary = boundary
 
     @property
     def name(self) -> str:
@@ -240,7 +273,13 @@ class FindSymbolTool(BaseTool):
 
     def execute(self, params: dict[str, Any]) -> ToolResult:
         symbol = params.get("symbol", "")
-        search_path = Path(params.get("path", "."))
+        raw_path = params.get("path", ".")
+        search_path = Path(raw_path)
+        if self._boundary is not None:
+            check = self._boundary.resolve(raw_path, operation="find symbol")
+            if not check.success:
+                return ToolResult(success=False, output="", error=check.error)
+            search_path = check.path or search_path
 
         if not symbol:
             return ToolResult(success=False, output="", error="symbol is required")
@@ -252,7 +291,12 @@ class FindSymbolTool(BaseTool):
         )
 
         matches: list[str] = []
-        for filepath in _iter_files(search_path, "*.py"):
+        for filepath in _iter_files(
+            search_path,
+            "*.py",
+            boundary=self._boundary,
+            skip_outside=self._boundary.is_inside(search_path) if self._boundary else False,
+        ):
             if len(matches) >= MAX_RESULTS:
                 break
             try:
@@ -284,17 +328,26 @@ class FindSymbolTool(BaseTool):
 # 内部辅助
 # ---------------------------------------------------------------------------
 
-def _iter_files(root: Path, glob_pattern: str):
+def _iter_files(
+    root: Path,
+    glob_pattern: str,
+    boundary: WorkspaceBoundary | None = None,
+    skip_outside: bool = False,
+):
     """
     递归遍历目录，跳过 _SKIP_DIRS，按 glob_pattern 过滤文件名。
     """
     if root.is_file():
+        if skip_outside and boundary is not None and not boundary.is_inside(root):
+            return
         yield root
         return
 
     for filepath in sorted(root.rglob(glob_pattern)):
         # 跳过黑名单目录
         if any(part in _SKIP_DIRS for part in filepath.parts):
+            continue
+        if skip_outside and boundary is not None and not boundary.is_inside(filepath):
             continue
         if filepath.is_file():
             yield filepath

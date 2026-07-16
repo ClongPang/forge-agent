@@ -15,11 +15,11 @@ tools/file_tool.py
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Any
 
 from tools.base import BaseTool, ToolResult
+from tools.path_guard import WorkspaceBoundary
 
 
 # 单次 file_read 最多返回的行数，超出提示用 file_view
@@ -35,6 +35,9 @@ class FileReadTool(BaseTool):
     params:
         path (str): 文件路径（相对或绝对）
     """
+
+    def __init__(self, boundary: WorkspaceBoundary | None = None) -> None:
+        self._boundary = boundary
 
     @property
     def name(self) -> str:
@@ -62,7 +65,14 @@ class FileReadTool(BaseTool):
         }
 
     def execute(self, params: dict[str, Any]) -> ToolResult:
-        path = Path(params.get("path", ""))
+        raw_path = params.get("path", "")
+        path = Path(raw_path)
+        if self._boundary is not None:
+            check = self._boundary.resolve(raw_path, operation="read file")
+            if not check.success:
+                return ToolResult(success=False, output="", error=check.error)
+            path = check.path or path
+
         if not path.exists():
             return ToolResult(
                 success=False,
@@ -113,6 +123,9 @@ class FileViewTool(BaseTool):
         start_line (int): 从第几行开始（1-indexed，默认 1）
     """
 
+    def __init__(self, boundary: WorkspaceBoundary | None = None) -> None:
+        self._boundary = boundary
+
     @property
     def name(self) -> str:
         return "file_view"
@@ -142,7 +155,14 @@ class FileViewTool(BaseTool):
         }
 
     def execute(self, params: dict[str, Any]) -> ToolResult:
-        path = Path(params.get("path", ""))
+        raw_path = params.get("path", "")
+        path = Path(raw_path)
+        if self._boundary is not None:
+            check = self._boundary.resolve(raw_path, operation="view file")
+            if not check.success:
+                return ToolResult(success=False, output="", error=check.error)
+            path = check.path or path
+
         start_line = max(1, int(params.get("start_line", 1)))
 
         if not path.exists():
@@ -189,6 +209,9 @@ class FileWriteTool(BaseTool):
         content (str): 要写入的内容
     """
 
+    def __init__(self, boundary: WorkspaceBoundary | None = None) -> None:
+        self._boundary = boundary
+
     @property
     def name(self) -> str:
         return "file_write"
@@ -219,8 +242,15 @@ class FileWriteTool(BaseTool):
         }
 
     def execute(self, params: dict[str, Any]) -> ToolResult:
-        path = Path(params.get("path", ""))
+        raw_path = params.get("path", "")
+        path = Path(raw_path)
         content = params.get("content", "")
+
+        if self._boundary is not None:
+            check = self._boundary.resolve(raw_path, operation="write file")
+            if not check.success:
+                return ToolResult(success=False, output="", error=check.error)
+            path = check.path or path
 
         try:
             path.parent.mkdir(parents=True, exist_ok=True)

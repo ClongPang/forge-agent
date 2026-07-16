@@ -416,7 +416,7 @@ cat logs/abc12345_*.jsonl | jq 'select(.event_type=="action") | .payload.action.
 
 ## 8. 安全机制
 
-Agent 有三层保护，防止误操作：
+Agent 有四层保护，防止误操作：
 
 ### 层 1：硬拦截黑名单（永远不执行，不问用户）
 
@@ -429,21 +429,32 @@ Agent 有三层保护，防止误操作：
 - `chmod -R 777 /`
 - `> /dev/sda`
 
-### 层 2：只读白名单（直接执行，不需确认）
+### 层 2：工作区边界
+
+文件、搜索、测试、git 和可识别的 shell 路径默认以 `--repo` 指定的目录为工作区。
+仓库内路径直接允许；仓库外路径需要确认。没有确认回调时（例如非交互 run
+或 GitHub Issue 自动化流程），仓库外路径会被拒绝。
+
+这会拦截常见逃逸方式：绝对路径（如 `/etc/hosts`）、`../`、repo sibling
+前缀路径、以及指向仓库外的 symlink。
+
+### 层 3：只读白名单（直接执行，不需确认）
 
 以下命令被认为是安全的只读操作，直接执行：
 
 `ls`、`cat`、`grep`、`find`、`git status`、`git diff`、`git log`、
 `pytest`、`python -m pytest`、`echo`、`pwd`、`diff`、`tree` 等
 
-### 层 3：写操作确认（仅在 `--confirm` 模式下）
+如果只读命令显式引用仓库外路径（如 `cat /etc/hosts`），仍然会触发工作区边界确认。
+
+### 层 4：写操作确认（仅在 `--confirm` 模式下）
 
 以下命令需要用户确认：
 
 `rm`、`mv`、`pip install`、`git commit`、`git push`、`curl`、`wget`、
 `chmod`、`sudo`、`docker`、重定向覆盖（`>`）等
 
-**默认行为（不加 `--confirm`）**：层 3 跳过，直接执行。适合自动化场景。
+**默认行为（不加 `--confirm`）**：写操作确认跳过，但仓库外路径访问仍会被拒绝。
 
 **开启确认（加 `--confirm`）**：遇到写操作会提示：
 
@@ -453,7 +464,7 @@ Agent 有三层保护，防止误操作：
   Allow? [y/N]
 ```
 
-**chat 模式默认开启确认**，每次执行危险命令都会询问。
+**chat 模式默认开启确认**，每次执行危险命令或访问仓库外路径都会询问。
 
 ---
 
