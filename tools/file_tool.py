@@ -20,6 +20,7 @@ from typing import Any
 
 from tools.base import BaseTool, ToolResult
 from tools.path_guard import WorkspaceBoundary
+from tools.security_policy import is_sensitive_path
 
 
 # 单次 file_read 最多返回的行数，超出提示用 file_view
@@ -78,6 +79,12 @@ class FileReadTool(BaseTool):
                 success=False,
                 output="",
                 error=f"File not found: {path}",
+            )
+        if is_sensitive_path(path, repo_root=self._boundary.root if self._boundary else None):
+            return ToolResult(
+                success=False,
+                output="",
+                error=f"Sensitive file read rejected: {path}",
             )
         if not path.is_file():
             return ToolResult(
@@ -167,6 +174,12 @@ class FileViewTool(BaseTool):
 
         if not path.exists():
             return ToolResult(success=False, output="", error=f"File not found: {path}")
+        if is_sensitive_path(path, repo_root=self._boundary.root if self._boundary else None):
+            return ToolResult(
+                success=False,
+                output="",
+                error=f"Sensitive file view rejected: {path}",
+            )
         if not path.is_file():
             return ToolResult(success=False, output="", error=f"Not a file: {path}")
 

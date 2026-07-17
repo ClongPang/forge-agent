@@ -20,6 +20,7 @@ from typing import Any
 
 from tools.base import BaseTool, ToolResult
 from tools.path_guard import WorkspaceBoundary
+from tools.security_policy import is_sensitive_path, should_skip_search_path
 
 
 MAX_RESULTS = 50        # 单次搜索最多返回的结果数
@@ -29,6 +30,7 @@ MAX_LINE_LENGTH = 200   # 单行超长时截断显示
 _SKIP_DIRS: frozenset[str] = frozenset({
     ".git", "__pycache__", ".venv", "venv", "node_modules",
     ".mypy_cache", ".pytest_cache", "dist", "build", "*.egg-info",
+    "logs",
 })
 
 
@@ -116,6 +118,8 @@ class SearchTextTool(BaseTool):
         )
 
         for filepath in files:
+            if should_skip_search_path(filepath, repo_root=self._boundary.root if self._boundary else None):
+                continue
             if len(matches) >= MAX_RESULTS:
                 break
             try:
@@ -209,6 +213,8 @@ class FindFilesTool(BaseTool):
             boundary=self._boundary,
             skip_outside=self._boundary.is_inside(search_path) if self._boundary else False,
         ):
+            if should_skip_search_path(filepath, repo_root=self._boundary.root if self._boundary else None):
+                continue
             results.append(str(filepath))
             if len(results) >= MAX_RESULTS:
                 break
@@ -297,6 +303,8 @@ class FindSymbolTool(BaseTool):
             boundary=self._boundary,
             skip_outside=self._boundary.is_inside(search_path) if self._boundary else False,
         ):
+            if should_skip_search_path(filepath, repo_root=self._boundary.root if self._boundary else None):
+                continue
             if len(matches) >= MAX_RESULTS:
                 break
             try:
@@ -340,6 +348,8 @@ def _iter_files(
     if root.is_file():
         if skip_outside and boundary is not None and not boundary.is_inside(root):
             return
+        if is_sensitive_path(root, repo_root=boundary.root if boundary else None):
+            return
         yield root
         return
 
@@ -348,6 +358,8 @@ def _iter_files(
         if any(part in _SKIP_DIRS for part in filepath.parts):
             continue
         if skip_outside and boundary is not None and not boundary.is_inside(filepath):
+            continue
+        if is_sensitive_path(filepath, repo_root=boundary.root if boundary else None):
             continue
         if filepath.is_file():
             yield filepath

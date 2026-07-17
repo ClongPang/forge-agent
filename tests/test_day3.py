@@ -15,7 +15,7 @@ import pytest
 from tools.file_tool import FileReadTool, FileViewTool, FileWriteTool
 from tools.git_tool import GitAddTool, GitCommitTool, GitDiffTool, GitStatusTool
 from tools.search_tool import FindFilesTool, FindSymbolTool, SearchTextTool
-from tools.shell_tool import ShellTool, _check_blocked, _truncate
+from tools.shell_tool import ShellTool, _check_blocked, _truncate, always_allow
 from tools.test_tool import PytestTool
 
 
@@ -193,17 +193,20 @@ class TestShellTool:
         assert "hello" in result.output
 
     def test_failed_command(self):
-        result = self.tool.execute({"cmd": "false"})
+        tool = ShellTool(confirm_callback=always_allow)
+        result = tool.execute({"cmd": "false"})
         assert not result.success
         assert "Exit code" in result.error
 
     def test_timeout(self):
-        result = self.tool.execute({"cmd": "sleep 10", "timeout": 1})
+        tool = ShellTool(confirm_callback=always_allow)
+        result = tool.execute({"cmd": "sleep 10", "timeout": 1})
         assert not result.success
         assert "timed out" in result.error.lower()
 
     def test_stderr_captured(self):
-        result = self.tool.execute({"cmd": "echo err >&2"})
+        tool = ShellTool(confirm_callback=always_allow)
+        result = tool.execute({"cmd": "echo err >&2"})
         assert "err" in result.output
 
     def test_empty_cmd_fails(self):
@@ -507,9 +510,14 @@ class TestGitAddAndCommit:
     add_tool = GitAddTool()
     commit_tool = GitCommitTool()
 
+    def test_add_without_paths_fails(self, git_repo):
+        result = self.add_tool.execute({"cwd": str(git_repo)})
+        assert not result.success
+        assert "explicit paths" in result.error
+
     def test_add_and_commit(self, git_repo):
         (git_repo / "f.py").write_text("x = 1\n")
-        add_result = self.add_tool.execute({"cwd": str(git_repo)})
+        add_result = self.add_tool.execute({"cwd": str(git_repo), "paths": ["f.py"]})
         assert add_result.success
 
         commit_result = self.commit_tool.execute({

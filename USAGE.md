@@ -438,23 +438,25 @@ Agent 有四层保护，防止误操作：
 这会拦截常见逃逸方式：绝对路径（如 `/etc/hosts`）、`../`、repo sibling
 前缀路径、以及指向仓库外的 symlink。
 
-### 层 3：只读白名单（直接执行，不需确认）
+### 层 3：严格只读白名单（直接执行，不需确认）
 
-以下命令被认为是安全的只读操作，直接执行：
+以下命令被认为是低风险只读操作，直接执行：
 
-`ls`、`cat`、`grep`、`find`、`git status`、`git diff`、`git log`、
+`ls`、`cat`、`grep`（非递归）、`rg`（不绕过 ignore/hidden 规则）、`find`、`git status`、`git diff`、`git log`、
 `pytest`、`python -m pytest`、`echo`、`pwd`、`diff`、`tree` 等
 
 如果只读命令显式引用仓库外路径（如 `cat /etc/hosts`），仍然会触发工作区边界确认。
+如果显式引用 `.env`、私钥、`.git/config`、`logs/*.jsonl` 等敏感文件，会直接拒绝。
+递归 `grep -r`、`rg --hidden`、`rg --no-ignore` 会进入确认路径。
 
-### 层 4：写操作确认（仅在 `--confirm` 模式下）
+### 层 4：高风险动作确认（仅在 `--confirm` 模式下）
 
 以下命令需要用户确认：
 
 `rm`、`mv`、`pip install`、`git commit`、`git push`、`curl`、`wget`、
 `chmod`、`sudo`、`docker`、重定向覆盖（`>`）等
 
-**默认行为（不加 `--confirm`）**：写操作确认跳过，但仓库外路径访问仍会被拒绝。
+**默认行为（不加 `--confirm`）**：需要确认的动作会被拒绝；只读低风险命令仍可直接执行。
 
 **开启确认（加 `--confirm`）**：遇到写操作会提示：
 

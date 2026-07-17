@@ -149,11 +149,12 @@ coding-agent/
 **流式输出**
 模型 thought 逐 token 实时打印，工具调用实时显示，体验接近 Claude Code。
 
-**安全机制（四层）**
+**安全机制**
 - 硬拦截黑名单：`rm -rf /`、`mkfs` 等永不执行
 - 工作区边界：文件、搜索、测试、git 和可识别 shell 路径默认限制在 repo 内
-- 只读白名单：`ls`、`grep`、`git status`、`pytest` 等直接执行
-- 外部路径/写操作确认：`--confirm` 或 chat 模式下需 y/n 确认；非交互默认拒绝
+- 工具策略层：敏感文件读取、危险写入、git stage/commit 在执行前拦截或确认
+- 严格只读白名单：`ls`、`rg`、`git diff`、`pytest` 等低风险命令直接执行
+- 高风险动作确认：`--confirm` 或 chat 模式下需 y/n 确认；非交互默认拒绝
 
 **Docker 沙箱**
 `--sandbox` 参数，所有命令在 `python:3.11-slim` 容器里执行，
@@ -181,7 +182,7 @@ repo 通过 bind mount 双向同步，默认断网。
   Allow? [y/N]
 ```
 
-不加 `--confirm` 的非交互 run/GitHub Issue 流程会拒绝仓库外路径访问。
+不加 `--confirm` 的非交互 run/GitHub Issue 流程会拒绝仓库外路径访问和需要确认的高风险动作。
 `--sandbox` 模式在 Docker 容器中执行，宿主机环境完全隔离。
 
 ---
@@ -193,7 +194,7 @@ repo 通过 bind mount 双向同步，默认断网。
 pip install -e ".[dev]"
 
 # 运行测试
-pytest                     # 全量（376 passed，7 skipped）
+pytest                     # 全量（444 passed，7 skipped）
 pytest tests/test_day3.py  # 单个文件
 
 # 可选：更多语言的 tree-sitter 支持

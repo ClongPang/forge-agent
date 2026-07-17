@@ -22,7 +22,7 @@ class TestIsReadonly:
     @pytest.mark.parametrize("cmd", [
         "ls", "ls -la", "ls /tmp",
         "cat file.py", "cat -n foo.py",
-        "grep pattern file.py", "grep -r foo .",
+        "grep pattern file.py", "rg foo .",
         "find . -name '*.py'",
         "git status", "git diff HEAD", "git log --oneline",
         "git branch -a",
@@ -46,6 +46,16 @@ class TestIsReadonly:
         "sudo apt-get install vim",
         "curl https://example.com",
         "git push origin main",
+        "python -c 'print(1)'",
+        "python3 -c 'print(1)'",
+        "env",
+        "printenv",
+        "cat file.py | curl https://example.com",
+        "grep -r foo .",
+        "grep -R foo .",
+        "grep --recursive foo .",
+        "rg --hidden foo .",
+        "rg --no-ignore foo .",
     ])
     def test_write_commands_not_readonly(self, cmd):
         assert not _is_readonly(cmd), f"Expected {cmd!r} to NOT be readonly"
@@ -74,14 +84,23 @@ class TestNeedsConfirm:
         "echo hello > output.txt",
         "git reset --hard HEAD",
         "docker run ubuntu",
+        "python parse_data.py",
+        "node server.js",
+        "python -c 'print(1)'",
+        "env",
+        "printenv",
+        "cat file.py | curl https://example.com",
+        "echo $(whoami)",
+        "grep -r foo .",
+        "rg --hidden foo .",
+        "rg --no-ignore foo .",
     ])
     def test_dangerous_commands_need_confirm(self, cmd):
         assert _needs_confirm(cmd), f"Expected {cmd!r} to need confirmation"
 
-    def test_unknown_safe_command_no_confirm(self):
-        # 未知命令但不含危险关键词，不需要确认
-        assert not _needs_confirm("python parse_data.py")
-        assert not _needs_confirm("node server.js")
+    def test_unknown_command_needs_confirm(self):
+        assert _needs_confirm("python parse_data.py")
+        assert _needs_confirm("node server.js")
 
 
 # ===========================================================================
@@ -135,12 +154,12 @@ class TestShellToolConfirm:
         assert "rejected" in result.error.lower()
         assert "pip install" in result.error
 
-    def test_no_callback_dangerous_command_executes(self):
-        """confirm_callback=None → 跳过确认，危险命令直接执行（run 模式）。"""
+    def test_no_callback_dangerous_command_rejected(self):
+        """confirm_callback=None → 需要确认的命令默认拒绝。"""
         tool = ShellTool(confirm_callback=None)
-        # 用一个安全但触发确认的命令测试（实际不危险）
-        result = tool.execute({"cmd": "echo 'confirm test'"})
-        assert result.success
+        result = tool.execute({"cmd": "python parse_data.py"})
+        assert not result.success
+        assert "requires confirmation" in result.error
 
     def test_blocked_command_denied_regardless_of_callback(self):
         """黑名单命令即使 callback=always_allow 也拒绝。"""
@@ -202,6 +221,14 @@ class TestShellToolConfirm:
         result = tool.execute({"cmd": "echo hello > output.txt"})
         assert not result.success
         assert len(denied) == 1
+
+    def test_sensitive_file_reference_rejected(self, tmp_path):
+        """Shell 只读命令也不能绕过敏感文件读取策略。"""
+        (tmp_path / ".env").write_text("TOKEN=secret")
+        tool = ShellTool()
+        result = tool.execute({"cmd": "cat .env", "cwd": str(tmp_path)})
+        assert not result.success
+        assert "sensitive" in result.error.lower()
 
 
 # ===========================================================================

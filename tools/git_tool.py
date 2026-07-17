@@ -238,7 +238,7 @@ class GitAddTool(BaseTool):
     暂存文件。
 
     params:
-        paths (list[str]): 要暂存的文件路径列表，默认 ["."]（暂存所有）
+        paths (list[str]): 要暂存的文件路径列表，必须显式传入
         cwd (str):         repo 根目录
     """
 
@@ -249,8 +249,8 @@ class GitAddTool(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "Stage files for commit. "
-            "Pass a list of paths, or omit to stage all changes (git add .)."
+            "Stage explicit files for commit. "
+            "Pass a list of paths; implicit git add . is rejected for safety."
         )
 
     @property
@@ -261,7 +261,7 @@ class GitAddTool(BaseTool):
                 "paths": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Files to stage. Default: ['.'] (all changes)",
+                    "description": "Files to stage. Must be explicit; git add . is rejected.",
                 },
                 "cwd": {"type": "string", "description": "Repository root directory"},
             },

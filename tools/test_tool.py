@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import re
 import shlex
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -110,9 +111,11 @@ class PytestTool(BaseTool):
         except ValueError as e:
             return ToolResult(success=False, output="", error=f"Invalid pytest args: {e}")
 
-        # 组装命令：--tb=short 足够 agent 理解，--no-header 减少噪音
+        # 组装命令：--tb=short 足够 agent 理解，--no-header 减少噪音。
+        # 本地 runtime 使用当前解释器，避免依赖 PATH 中存在 "python"。
+        python_bin = sys.executable if isinstance(self._runtime, LocalRuntime) else "python"
         cmd_parts = [
-            "python", "-m", "pytest",
+            python_bin, "-m", "pytest",
             test_path,
             "--tb=short",
             "--no-header",

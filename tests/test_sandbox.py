@@ -20,7 +20,7 @@ from tools.runtime import (
     DockerRuntime, LocalRuntime, RunResult, create_runtime,
     CONTAINER_WORKDIR, SANDBOX_IMAGE,
 )
-from tools.shell_tool import ShellTool
+from tools.shell_tool import ShellTool, always_allow
 from tools.test_tool import PytestTool
 from tools.git_tool import GitStatusTool
 
@@ -401,7 +401,7 @@ class TestDockerRuntimeIntegration:
     def test_shell_tool_with_docker_runtime(self, tmp_path):
         """ShellTool + DockerRuntime 端到端。"""
         with DockerRuntime(repo_path=str(tmp_path)) as rt:
-            tool = ShellTool(runtime=rt)
+            tool = ShellTool(confirm_callback=always_allow, runtime=rt)
             result = tool.execute({"cmd": "python3 --version"})
         assert result.success
         assert "Python" in result.output
