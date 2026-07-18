@@ -13,12 +13,13 @@
 4. [chat 模式详解](#4-chat-模式详解)
 5. [run 模式详解](#5-run-模式详解)
 6. [GitHub Issue 模式](#6-github-issue-模式)
-7. [查看运行日志](#7-查看运行日志)
-8. [安全机制](#8-安全机制)
-9. [Docker 沙箱](#9-docker-沙箱)
-10. [写好任务描述的技巧](#10-写好任务描述的技巧)
-11. [常见问题](#11-常见问题)
-12. [配置参考](#12-配置参考)
+7. [SWE-bench 评测准备](#7-swe-bench-评测准备)
+8. [查看运行日志](#8-查看运行日志)
+9. [安全机制](#9-安全机制)
+10. [Docker 沙箱](#10-docker-沙箱)
+11. [写好任务描述的技巧](#11-写好任务描述的技巧)
+12. [常见问题](#12-常见问题)
+13. [配置参考](#13-配置参考)
 
 ---
 
@@ -61,6 +62,12 @@ pip install \
 
 ```bash
 pip install tiktoken
+```
+
+**可选：安装 SWE-bench predictions 生成依赖**
+
+```bash
+pip install -e ".[swebench]"
 ```
 
 ---
@@ -153,6 +160,7 @@ python smoke_test.py
 | **chat** | `forgeagent chat` | 持续对话，边改边聊，最常用 |
 | **run** | `forgeagent run --task "..."` | 一次性明确任务，批处理 |
 | **GitHub Issue** | `python -m entry.github_issue` | 自动修复 Issue 并提 PR |
+| **SWE-bench** | `python -m entry.swebench generate` | 批量生成 `predictions.jsonl`，交给官方 harness 评分 |
 
 ---
 
@@ -357,7 +365,66 @@ python -m entry.github_issue \
 
 ---
 
-## 7. 查看运行日志
+## 7. SWE-bench 评测准备
+
+Forge Agent 只负责生成 SWE-bench 官方需要的 `predictions.jsonl`。
+正式评分由官方 SWE-bench harness 在 Docker 环境中完成。
+
+### 生成 predictions
+
+先在本项目环境安装可选依赖：
+
+```bash
+pip install -e ".[swebench]"
+```
+
+生成 Lite dev 的单条预测，适合先验证流程：
+
+```bash
+python -m entry.swebench generate \
+  --dataset-name princeton-nlp/SWE-bench_Lite \
+  --split dev \
+  --limit 1 \
+  --work-dir runs/swebench \
+  --output runs/swebench/dev_predictions.jsonl
+```
+
+常用选项：
+
+```bash
+python -m entry.swebench generate \
+  --split dev \
+  --instance-ids sympy__sympy-20590 \
+  --output runs/swebench/dev_predictions.jsonl \
+  --model deepseek-v4-pro \
+  --max-steps 60
+```
+
+生成器会写两个文件：
+
+- `predictions.jsonl`：提交给官方 harness 的 patch 文件
+- `*.metadata.jsonl`：Forge Agent 的状态、token、步数、日志路径和 patch 大小
+
+### 官方评分
+
+把 `predictions.jsonl` 复制到安装了 SWE-bench 的 Linux x86_64 机器上：
+
+```bash
+python -m swebench.harness.run_evaluation \
+  --dataset_name princeton-nlp/SWE-bench_Lite \
+  --split dev \
+  --predictions_path /path/to/dev_predictions.jsonl \
+  --max_workers 2 \
+  --run_id forgeagent-lite-dev
+```
+
+`entry.swebench` 不读取 gold `patch`、`test_patch`、`FAIL_TO_PASS` 或
+`PASS_TO_PASS` 给 agent。它只把 `problem_statement` 和代码仓库交给 agent，
+然后从 `git diff HEAD` 抽取 patch。
+
+---
+
+## 8. 查看运行日志
 
 每次运行会在 `./logs/` 目录下生成 JSONL 格式的事件日志，记录完整的运行过程。
 
@@ -435,7 +502,7 @@ forgeagent eval add-trace TRACE_OR_URL \
 
 ---
 
-## 8. 安全机制
+## 9. 安全机制
 
 Agent 有四层保护，防止误操作：
 
@@ -491,7 +558,7 @@ Agent 有四层保护，防止误操作：
 
 ---
 
-## 9. Docker 沙箱
+## 10. Docker 沙箱
 
 加 `--sandbox` 参数，所有 shell 命令、测试、git 操作都在 Docker 容器里执行，
 宿主机环境完全隔离。
@@ -527,7 +594,7 @@ forgeagent chat --sandbox
 
 ---
 
-## 10. 写好任务描述的技巧
+## 11. 写好任务描述的技巧
 
 任务描述的质量直接决定 agent 的效果。
 
@@ -609,7 +676,7 @@ forgeagent run --task-file task.txt
 
 ---
 
-## 11. 常见问题
+## 12. 常见问题
 
 **Q：agent 没有任何输出，卡住了**
 
@@ -672,7 +739,7 @@ python -m entry.github_issue --repo owner/repo --issue 42 \
 
 ---
 
-## 12. 配置参考
+## 13. 配置参考
 
 `config/default.yaml` 完整说明：
 
@@ -761,6 +828,11 @@ forgeagent run --task "..." --sandbox    # Docker 沙箱
 # GitHub Issue
 export GITHUB_TOKEN=ghp_xxx
 python -m entry.github_issue -r owner/repo -i 42 -l /tmp/repo
+
+# SWE-bench predictions
+python -m entry.swebench generate \
+  --split dev --limit 1 \
+  --output runs/swebench/dev_predictions.jsonl
 
 # 查看日志
 forgeagent log list

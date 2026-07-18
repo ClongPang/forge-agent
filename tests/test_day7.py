@@ -463,3 +463,8 @@ class TestPyprojectToml:
         full_deps = data["project"]["optional-dependencies"]["full"]
         assert any(dep.startswith("tiktoken") for dep in full_deps)
         assert any(dep.startswith("tree-sitter-javascript") for dep in full_deps)
+
+    def test_pyproject_has_swebench_extras(self):
+        data = self._load_pyproject()
+        swebench_deps = data["project"]["optional-dependencies"]["swebench"]
+        assert any(dep.startswith("datasets") for dep in swebench_deps)

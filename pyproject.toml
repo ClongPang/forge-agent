@@ -33,6 +33,9 @@ full = [
     "tree-sitter-rust>=0.22.0",
     "tree-sitter-java>=0.22.0",
 ]
+swebench = [
+    "datasets>=2.19.0",
+]
 
 [project.scripts]
 forgeagent = "entry.cli:main"

@@ -120,7 +120,8 @@ coding-agent/
 ├── entry/              # 入口层
 │   ├── cli.py          # Click CLI（run / chat / log / eval 子命令）
 │   ├── chat.py         # ChatSession，跨轮持久化历史
-│   └── github_issue.py # GitHub Issue → PR 自动化
+│   ├── github_issue.py # GitHub Issue → PR 自动化
+│   └── swebench.py     # SWE-bench predictions.jsonl 生成器
 │
 ├── config/
 │   ├── default.yaml    # 默认配置
@@ -204,6 +205,9 @@ pip install tree-sitter-javascript tree-sitter-typescript \
 
 # 可选：精确 token 计数
 pip install tiktoken
+
+# 可选：生成 SWE-bench predictions.jsonl
+pip install -e ".[swebench]"
 ```
 
 ---
@@ -224,6 +228,11 @@ forgeagent log show LOG_FILE
 
 # eval
 forgeagent eval add-trace TRACE_OR_URL [--dataset DATASET]
+
+# SWE-bench patch generation（正式评分仍由官方 SWE-bench harness 执行）
+python -m entry.swebench generate \
+    --split dev --limit 1 \
+    --output runs/swebench/dev_predictions.jsonl
 
 # github issue
 python -m entry.github_issue \
