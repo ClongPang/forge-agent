@@ -427,6 +427,27 @@ class TestPrintStep:
         assert "Tool[1.1]: shell" in out
         assert "Tool[1.2]: test" in out
 
+    def test_streamed_complete_summary_is_not_reprinted(self, capsys):
+        _print_step(Event(
+            event_type=EventType.TASK_COMPLETE,
+            task_id="t",
+            payload={"steps": 1, "summary": "STREAMED_FINAL_SUMMARY"},
+        ), streamed_text="prefix\nSTREAMED_FINAL_SUMMARY")
+
+        out = capsys.readouterr().out
+        assert "✓ COMPLETE" in out
+        assert "STREAMED_FINAL_SUMMARY" not in out
+
+    def test_unstreamed_complete_summary_is_printed(self, capsys):
+        _print_step(Event(
+            event_type=EventType.TASK_COMPLETE,
+            task_id="t",
+            payload={"steps": 1, "summary": "UNSTREAMED_FINAL_SUMMARY"},
+        ))
+
+        out = capsys.readouterr().out
+        assert "UNSTREAMED_FINAL_SUMMARY" in out
+
 
 class TestCliLog:
     def test_log_show(self, tmp_path):

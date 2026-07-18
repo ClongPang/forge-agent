@@ -22,8 +22,8 @@ from agent.task import (
 )
 from config.schema import AppConfig
 from context.history import ConversationHistory
-from entry.chat import ChatSession, _print_event_live
-from llm.base import LLMMessage, MockBackend
+from entry.chat import ChatRenderState, ChatSession, _print_event_live
+from llm.base import LLMMessage, LLMModelBehaviorError, MockBackend
 from tools.base import NoopTool, ToolRegistry
 
 
@@ -55,6 +55,20 @@ def make_session(backend, registry, cfg, tmp_path) -> ChatSession:
         repo_path=str(tmp_path),
         log_dir=cfg.agent.log_dir,
     )
+
+
+class FinalMessageStreamingBackend(MockBackend):
+    """Mock backend that streams the same final text returned in Action.message."""
+
+    def stream(self, messages, tools, on_text=None, on_thought=None):
+        response = self.complete(messages, tools)
+        action = response.action
+        if on_text:
+            if action.action_type == ActionType.FINISH:
+                on_text(action.message or "")
+            elif action.action_type == ActionType.TOOL_CALL and action.thought:
+                on_text(action.thought)
+        return response
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +201,18 @@ class TestChatEdgeCases:
         # give_up 返回 True（session 继续），不退出
         assert ok
 
+    def test_model_output_invalid_returns_false(self, tmp_path, cfg, registry):
+        class InvalidBackend(MockBackend):
+            def complete(self, messages, tools):
+                self.call_count += 1
+                self.received_messages.append(messages)
+                raise LLMModelBehaviorError("bad tool args")
+
+        session = make_session(InvalidBackend([]), registry, cfg, tmp_path)
+        ok = session.run_round("malformed response task")
+
+        assert not ok
+
     def test_multiple_tool_calls_in_one_round(self, tmp_path, cfg, registry):
         script = [
             Action(ActionType.TOOL_CALL, "step1", ToolCall("shell", {"cmd": "ls"})),
@@ -231,18 +257,11 @@ class TestChatEdgeCases:
 # ---------------------------------------------------------------------------
 
 class TestLiveOutput:
-    def _reset_live_state(self):
-        for attr in (
-            "_pending_message",
-            "_streamed_thought",
-            "_pending_tool_names",
-            "_multi_tool_step",
-        ):
-            if hasattr(_print_event_live, attr):
-                delattr(_print_event_live, attr)
+    def _state(self) -> ChatRenderState:
+        return ChatRenderState()
 
     def test_give_up_prints_only_final_failure(self, capsys):
-        self._reset_live_state()
+        state = self._state()
         action = Action(
             ActionType.GIVE_UP,
             "stuck",
@@ -253,19 +272,19 @@ class TestLiveOutput:
             event_type=EventType.ACTION,
             task_id="t",
             payload={"step": 1, "action": action.to_dict()},
-        ))
+        ), state)
         _print_event_live(Event(
             event_type=EventType.TASK_FAILED,
             task_id="t",
             payload={"steps": 1, "reason": "cannot solve"},
-        ))
+        ), state)
 
         out = capsys.readouterr().out
         assert "✗ give_up" not in out
         assert "Failed: cannot solve" in out
 
     def test_multi_tool_output_pairs_observations_by_queue(self, capsys):
-        self._reset_live_state()
+        state = self._state()
         calls = [
             ToolCall("shell", {"cmd": "ls"}, id="call_1"),
             ToolCall("test", {}, id="call_2"),
@@ -281,7 +300,7 @@ class TestLiveOutput:
             event_type=EventType.ACTION,
             task_id="t",
             payload={"step": 1, "action": action.to_dict()},
-        ))
+        ), state)
         _print_event_live(Event(
             event_type=EventType.OBSERVATION,
             task_id="t",
@@ -293,7 +312,7 @@ class TestLiveOutput:
                     tool_name="shell",
                 ).to_dict(),
             },
-        ))
+        ), state)
         _print_event_live(Event(
             event_type=EventType.OBSERVATION,
             task_id="t",
@@ -306,13 +325,79 @@ class TestLiveOutput:
                     error="failed",
                 ).to_dict(),
             },
-        ))
+        ), state)
 
         out = capsys.readouterr().out
         assert "[1.1] shell" in out
         assert "[1.2] test" in out
         assert "✓ [shell]" in out
         assert "✗ [test] failed" in out
+
+    def test_non_stream_finish_prints_complete_message(self, capsys):
+        state = self._state()
+        action = Action(
+            ActionType.FINISH,
+            "done",
+            message="FINAL_NON_STREAM_ONLY_ONCE",
+        )
+
+        _print_event_live(Event(
+            event_type=EventType.ACTION,
+            task_id="t",
+            payload={"step": 1, "action": action.to_dict()},
+        ), state)
+        _print_event_live(Event(
+            event_type=EventType.TASK_COMPLETE,
+            task_id="t",
+            payload={"steps": 1, "summary": action.message},
+        ), state)
+
+        out = capsys.readouterr().out
+        assert out.count("FINAL_NON_STREAM_ONLY_ONCE") == 1
+
+    def test_streamed_finish_not_reprinted_across_rounds(
+        self, tmp_path, cfg, registry, capsys
+    ):
+        script = [
+            Action(ActionType.FINISH, "done1", message="FIRST_STREAM_FINAL"),
+            Action(ActionType.FINISH, "done2", message="SECOND_STREAM_FINAL"),
+        ]
+        session = make_session(
+            FinalMessageStreamingBackend(script),
+            registry,
+            cfg,
+            tmp_path,
+        )
+
+        session.run_round("round 1")
+        session.run_round("round 2")
+
+        out = capsys.readouterr().out
+        assert out.count("FIRST_STREAM_FINAL") == 1
+        assert out.count("SECOND_STREAM_FINAL") == 1
+
+    def test_streamed_finish_after_tool_call_not_reprinted(
+        self, tmp_path, cfg, registry, capsys
+    ):
+        script = [
+            Action(
+                ActionType.TOOL_CALL,
+                "streamed tool preamble",
+                ToolCall("shell", {"cmd": "echo hi"}),
+            ),
+            Action(ActionType.FINISH, "done", message="TOOL_STREAM_FINAL"),
+        ]
+        session = make_session(
+            FinalMessageStreamingBackend(script),
+            registry,
+            cfg,
+            tmp_path,
+        )
+
+        session.run_round("run command then finish")
+
+        out = capsys.readouterr().out
+        assert out.count("TOOL_STREAM_FINAL") == 1
 
 
 # ---------------------------------------------------------------------------

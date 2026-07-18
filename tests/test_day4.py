@@ -22,7 +22,14 @@ from agent.prompt import (
     reflection_test_failed,
 )
 from agent.task import ActionType
-from llm.base import LLMMessage, LLMToolSchema
+from llm.base import (
+    LLMContentFilteredError,
+    LLMMessage,
+    LLMModelBehaviorError,
+    LLMOutputTruncatedError,
+    LLMProviderProtocolError,
+    LLMToolSchema,
+)
 from llm.router import create_backend, create_backend_from_config
 
 
@@ -363,7 +370,7 @@ class TestOpenAICompatBackend:
             },
         }]
 
-    def test_invalid_tool_arguments_give_up(self):
+    def test_invalid_tool_arguments_raises_model_behavior_error(self):
         backend = self._make_backend()
         response = self._make_response(
             "tool_calls",
@@ -372,9 +379,31 @@ class TestOpenAICompatBackend:
         )
         backend._client.chat.completions.create.return_value = response
 
-        result = backend.complete(make_messages("user", "fix it"), [make_tool_schema()])
-        assert result.action.action_type == ActionType.GIVE_UP
-        assert "Invalid tool arguments JSON" in result.action.message
+        with pytest.raises(LLMModelBehaviorError) as exc_info:
+            backend.complete(make_messages("user", "fix it"), [make_tool_schema()])
+
+        assert "Invalid tool arguments JSON" in str(exc_info.value)
+        assert exc_info.value.input_tokens == 80
+        assert exc_info.value.output_tokens == 40
+
+    def test_non_object_tool_arguments_raises_model_behavior_error(self):
+        backend = self._make_backend()
+        response = self._make_response(
+            "tool_calls",
+            tool_calls=[self._make_tool_call_raw("shell", '["pytest"]')],
+        )
+        backend._client.chat.completions.create.return_value = response
+
+        with pytest.raises(LLMModelBehaviorError, match="JSON object"):
+            backend.complete(make_messages("user", "fix it"), [make_tool_schema()])
+
+    def test_tool_calls_finish_reason_without_calls_raises_model_behavior_error(self):
+        backend = self._make_backend()
+        response = self._make_response("tool_calls", tool_calls=None)
+        backend._client.chat.completions.create.return_value = response
+
+        with pytest.raises(LLMModelBehaviorError, match="no tool calls"):
+            backend.complete(make_messages("user", "fix it"), [make_tool_schema()])
 
     def test_stop_response_is_finish(self):
         backend = self._make_backend()
@@ -385,6 +414,14 @@ class TestOpenAICompatBackend:
         assert result.action.action_type == ActionType.FINISH
         assert result.action.message == "Task is done."
         assert result.action.thought == ""
+
+    def test_empty_stop_response_raises_model_behavior_error(self):
+        backend = self._make_backend()
+        response = self._make_response("stop", content="")
+        backend._client.chat.completions.create.return_value = response
+
+        with pytest.raises(LLMModelBehaviorError, match="no final content"):
+            backend.complete(make_messages("user", "fix it"), [])
 
     def test_reasoning_content_preserved_for_finish(self):
         backend = self._make_backend()
@@ -440,13 +477,44 @@ class TestOpenAICompatBackend:
         assert result.assistant_message is not None
         assert len(result.assistant_message.tool_calls) == 2
 
-    def test_length_finish_reason_is_give_up(self):
+    def test_length_finish_reason_raises_output_truncated(self):
         backend = self._make_backend()
         response = self._make_response("length", content="...")
         backend._client.chat.completions.create.return_value = response
 
-        result = backend.complete(make_messages("user", "fix it"), [])
-        assert result.action.action_type == ActionType.GIVE_UP
+        with pytest.raises(LLMOutputTruncatedError) as exc_info:
+            backend.complete(make_messages("user", "fix it"), [])
+
+        assert exc_info.value.input_tokens == 80
+        assert exc_info.value.output_tokens == 40
+
+    def test_content_filter_finish_reason_raises_content_filtered(self):
+        backend = self._make_backend()
+        response = self._make_response("content_filter")
+        backend._client.chat.completions.create.return_value = response
+
+        with pytest.raises(LLMContentFilteredError, match="content filter"):
+            backend.complete(make_messages("user", "fix it"), [])
+
+    def test_missing_message_raises_provider_protocol_error(self):
+        backend = self._make_backend()
+        usage = SimpleNamespace(prompt_tokens=80, completion_tokens=40)
+        choice = SimpleNamespace(finish_reason="stop", message=None)
+        backend._client.chat.completions.create.return_value = SimpleNamespace(
+            choices=[choice],
+            usage=usage,
+        )
+
+        with pytest.raises(LLMProviderProtocolError, match="no message"):
+            backend.complete(make_messages("user", "fix it"), [])
+
+    def test_unknown_finish_reason_raises_provider_protocol_error(self):
+        backend = self._make_backend()
+        response = self._make_response("unknown_reason", content="...")
+        backend._client.chat.completions.create.return_value = response
+
+        with pytest.raises(LLMProviderProtocolError, match="Unsupported"):
+            backend.complete(make_messages("user", "fix it"), [])
 
     def test_tools_converted_to_openai_format(self):
         backend = self._make_backend()

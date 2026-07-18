@@ -17,6 +17,7 @@ history 跨轮保留，像 Claude Code 一样可以持续对话。
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 import time
 import sys
 from pathlib import Path
@@ -49,7 +50,31 @@ def magenta(t: str) -> str: return _c(t, "35")
 # 实时 event 打印（比 cli.py 的版本更简洁，适合持续对话）
 # ---------------------------------------------------------------------------
 
-def _print_event_live(event) -> None:
+
+@dataclass
+class ChatRenderState:
+    """Terminal-only state for rendering one live chat round."""
+
+    streamed_text: str = ""
+    pending_tool_names: list[str] = field(default_factory=list)
+    multi_tool_step: bool = False
+    stream_started: bool = False
+    thought_printed: bool = False
+
+    def reset_round(self) -> None:
+        self.streamed_text = ""
+        self.pending_tool_names.clear()
+        self.multi_tool_step = False
+        self.stream_started = False
+        self.thought_printed = False
+
+    def message_was_streamed(self, message: str) -> bool:
+        msg = message.strip()
+        streamed = self.streamed_text.strip()
+        return bool(msg and (streamed == msg or streamed.endswith(msg)))
+
+
+def _print_event_live(event, state: ChatRenderState) -> None:
     """每条 event 写入 log 后立刻调用，实时显示。"""
     from agent.task import EventType
     etype = event.event_type
@@ -73,10 +98,8 @@ def _print_event_live(event) -> None:
             sys.stdout.flush()
 
         if tool_calls:
-            _print_event_live._pending_tool_names = [
-                item.get("name", "") for item in tool_calls
-            ]
-            _print_event_live._multi_tool_step = len(tool_calls) > 1
+            state.pending_tool_names = [item.get("name", "") for item in tool_calls]
+            state.multi_tool_step = len(tool_calls) > 1
             # 打印关键参数
             for idx, tool_call in enumerate(tool_calls, start=1):
                 tool_name = tool_call.get("name", "")
@@ -97,11 +120,11 @@ def _print_event_live(event) -> None:
                     click.echo(cyan(f"  {short_param}{suffix}"))
                 else:
                     click.echo()
+            state.streamed_text = ""
         elif atype == "finish":
             click.echo(green(f"\n  [{step}] ✓ finish"))
-            # 把 message 存到全局，供 TASK_COMPLETE event 打印
-            _finish_message = action.get("message", "") or ""
-            _print_event_live._pending_message = _finish_message
+        elif atype == "give_up":
+            state.streamed_text = ""
 
     elif etype == EventType.OBSERVATION:
         obs = p["observation"]
@@ -110,15 +133,14 @@ def _print_event_live(event) -> None:
         error = obs.get("error")
 
         # 从上一条 action event 的队列取工具名，支持同一 step 多个 tool call。
-        pending = getattr(_print_event_live, "_pending_tool_names", [])
+        pending = state.pending_tool_names
         if pending:
             tool_name = pending.pop(0)
-            _print_event_live._pending_tool_names = pending
         else:
             tool_name = obs.get("tool_name", "")
-        multi_tool_step = bool(getattr(_print_event_live, "_multi_tool_step", False))
+        multi_tool_step = state.multi_tool_step
         if not pending:
-            _print_event_live._multi_tool_step = False
+            state.multi_tool_step = False
 
         # 只读类工具：只显示 ✓ 或 ✗，不打印内容（内容已被模型读取，用户不需要看）
         SILENT_TOOLS = {"file_read", "file_view", "file_write", "find_files", "find_symbol"}
@@ -142,28 +164,26 @@ def _print_event_live(event) -> None:
             click.echo(red(f"  ✗{label} {error or output[:120]}"))
 
     elif etype == EventType.REFLECTION:
+        state.streamed_text = ""
         reason = p.get("reason", "")
         click.echo(yellow(f"\n  ⟳ Reflection ({reason}) — reconsidering approach...\n"))
 
     elif etype == EventType.TASK_COMPLETE:
-        # 取出 finish action 存的 message
-        message = getattr(_print_event_live, "_pending_message", "")
-        _print_event_live._pending_message = ""
+        message = p.get("summary", "")
 
         if message:
-            # 获取流式打印的 thought（存在 stream_callback 里）
-            streamed = getattr(_print_event_live, "_streamed_thought", "").strip()
             msg_stripped = message.strip()
 
-            if msg_stripped and msg_stripped != streamed:
-                # thought 和 message 不同（如 Claude）→ 单独打印最终回答
+            if msg_stripped and not state.message_was_streamed(msg_stripped):
+                # 未通过 stream_callback 展示过最终回答时，在完成事件里补打。
                 import sys
                 sys.stdout.write("\n")
                 sys.stdout.flush()
                 click.echo(msg_stripped)
-            # thought == message（如 DeepSeek flash）→ 已经流式打印过，不重复
+        state.streamed_text = ""
 
     elif etype == EventType.TASK_FAILED:
+        state.streamed_text = ""
         reason = p.get("reason", "")
         click.echo(red(bold(f"\n  ❌ Failed: {reason}")))
 
@@ -190,40 +210,37 @@ class ChatSession:
         self.log_dir = log_dir
         self.config = config
         self._confirm_callback = confirm_callback
-
-        # 流式回调：每个 token 立刻 flush 到终端
-        _stream_started = [False]
-        _thought_printed = [False]  # 标记是否打过 thought，用于 message 前换行
-        _streamed_buf = []   # 记录流式打印的内容，用于和 message 比较
+        self._render_state = ChatRenderState()
 
         def _thought_cb(text: str) -> None:
             """推理过程：dim 暗色，表示模型在思考"""
             import sys
-            if not _stream_started[0]:
+            state = self._render_state
+            if not state.stream_started:
                 sys.stdout.write("\r  ")
                 sys.stdout.flush()
-                _stream_started[0] = True
+                state.stream_started = True
             sys.stdout.write(dim(text))
             sys.stdout.flush()
-            _thought_printed[0] = True
+            state.thought_printed = True
 
         def _stream_cb(text: str) -> None:
             """最终回答：正常亮色"""
             import sys
-            if not _stream_started[0]:
+            state = self._render_state
+            if not state.stream_started:
                 # 第一次打 message，之前没打过任何内容
                 sys.stdout.write("\r  ")
                 sys.stdout.flush()
-                _stream_started[0] = True
-            elif _thought_printed[0]:
+                state.stream_started = True
+            elif state.thought_printed:
                 # 之前打过 thought，先换两行作为分隔再打 message
                 sys.stdout.write("\n\n")
                 sys.stdout.flush()
-                _thought_printed[0] = False  # 只换一次
+                state.thought_printed = False  # 只换一次
             sys.stdout.write(text)
             sys.stdout.flush()
-            _streamed_buf.append(text)
-            _print_event_live._streamed_thought = "".join(_streamed_buf)
+            state.streamed_text += text
 
         self.tracer = build_tracer_from_config(
             config,
@@ -263,13 +280,15 @@ class ChatSession:
             user_input: 用户这轮的输入
 
         Returns:
-            True 表示成功/正常结束，False 表示失败
+            True 表示本轮成功，或 agent 明确主动放弃但 session 可继续。
+            False 表示 provider/model/safety/loop/max_steps 等异常终态。
         """
         from agent.event_log import EventLog
-        from agent.task import Task
+        from agent.task import RunStatus, Task
         from llm.base import LLMMessage
 
         self.round_count += 1
+        self._render_state.reset_round()
 
         # 把用户输入追加到共享 history
         self._shared_history.add(LLMMessage(role="user", content=user_input))
@@ -317,7 +336,7 @@ class ChatSession:
             f"{elapsed:.1f}s ───"
         ))
 
-        return result.is_success() or result.status.value == "gave_up" # llm输出被判断为gave_up时同样终止本轮
+        return result.is_success() or result.status == RunStatus.GAVE_UP
 
     def _run_with_live_print(self, task, log):
         """
@@ -330,7 +349,7 @@ class ChatSession:
 
         def live_append(event):
             original_append(event)
-            _print_event_live(event)
+            _print_event_live(event, self._render_state)
 
         log._append = live_append
 

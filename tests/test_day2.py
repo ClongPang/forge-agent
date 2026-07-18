@@ -19,8 +19,15 @@ import pytest
 
 from agent.core import Agent, AgentConfig
 from agent.event_log import EventLog
-from agent.task import Action, ActionType, RunStatus, Task, ToolCall
-from llm.base import MockBackend
+from agent.task import Action, ActionType, EventType, RunStatus, Task, ToolCall
+from llm.base import (
+    LLMContentFilteredError,
+    LLMModelBehaviorError,
+    LLMOutputTruncatedError,
+    LLMProviderProtocolError,
+    LLMResponse,
+    MockBackend,
+)
 from tools.base import FailingTool, NoopTool, ToolRegistry
 
 
@@ -93,6 +100,34 @@ class SchemaTool(NoopTool):
     @property
     def parameters_schema(self) -> dict:
         return self._schema
+
+
+class ErrorBackend(MockBackend):
+    """测试专用：按顺序抛出错误，用完后返回 finish。"""
+
+    def __init__(self, errors: list[Exception]) -> None:
+        super().__init__([make_finish_action("repaired")])
+        self._errors = errors
+
+    def complete(self, messages, tools):
+        self.call_count += 1
+        self.received_messages.append(messages)
+        if self._errors:
+            raise self._errors.pop(0)
+        return LLMResponse(
+            action=make_finish_action("repaired"),
+            raw_content="repaired",
+            input_tokens=11,
+            output_tokens=6,
+        )
+
+
+def _llm_error(message="bad output", error_type=LLMModelBehaviorError):
+    return error_type(
+        message,
+        input_tokens=10,
+        output_tokens=5,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -472,7 +507,7 @@ class TestAgentMaxSteps:
 # ---------------------------------------------------------------------------
 
 class TestLoopDetection:
-    def test_loop_detected_gives_up(self, tmp_path):
+    def test_loop_detected_returns_loop_detected_status(self, tmp_path):
         task = Task(
             task_id="looptest",
             description="infinite loop",
@@ -490,8 +525,12 @@ class TestLoopDetection:
 
         result = agent.run(task, log)
 
-        assert result.status == RunStatus.GAVE_UP
+        assert result.status == RunStatus.LOOP_DETECTED
         assert "Loop detected" in result.summary
+        failed_events = [
+            e for e in log.replay() if e.event_type == EventType.TASK_FAILED
+        ]
+        assert len(failed_events) == 1
         log.close()
 
     def test_different_actions_not_detected_as_loop(self, task, log, registry):
@@ -615,6 +654,102 @@ class TestReflectionNoEdit:
         no_edit_reflections = [e for e in reflection_events if e.payload["reason"] == "no_edit"]
         assert len(no_edit_reflections) >= 1
         log.close()
+
+
+# ---------------------------------------------------------------------------
+# Agent.run — 模型输出修复
+# ---------------------------------------------------------------------------
+
+class TestModelOutputRecovery:
+    def test_model_behavior_error_repairs_and_succeeds(self, task, log, registry):
+        backend = ErrorBackend([
+            _llm_error("Invalid tool arguments JSON"),
+        ])
+        config = AgentConfig(
+            model_output_repair_max_attempts=2,
+            llm_retry_delay=0.01,
+        )
+        agent = Agent(backend, registry, config)
+
+        result = agent.run(task, log)
+
+        assert result.status == RunStatus.SUCCESS
+        assert backend.call_count == 2
+        assert result.total_tokens == 32
+        second_messages = backend.received_messages[1]
+        assert any(
+            "Invalid tool arguments JSON" in msg.content
+            and "valid next step" in msg.content
+            for msg in second_messages
+        )
+
+    def test_model_behavior_error_exhausts_repair_attempts(self, task, log, registry):
+        backend = ErrorBackend([
+            _llm_error("bad json"),
+            _llm_error("still bad"),
+            _llm_error("still bad again"),
+        ])
+        config = AgentConfig(
+            model_output_repair_max_attempts=2,
+            llm_retry_delay=0.01,
+        )
+        agent = Agent(backend, registry, config)
+
+        result = agent.run(task, log)
+
+        assert result.status == RunStatus.MODEL_OUTPUT_INVALID
+        assert backend.call_count == 3
+        assert result.steps_taken == 3
+        assert "repair attempts exhausted" in result.summary
+
+    def test_output_truncated_exhausts_repair_attempts(self, task, log, registry):
+        backend = ErrorBackend([
+            _llm_error("token limit", LLMOutputTruncatedError),
+            _llm_error("token limit", LLMOutputTruncatedError),
+            _llm_error("token limit", LLMOutputTruncatedError),
+        ])
+        config = AgentConfig(
+            model_output_repair_max_attempts=2,
+            llm_retry_delay=0.01,
+        )
+        agent = Agent(backend, registry, config)
+
+        result = agent.run(task, log)
+
+        assert result.status == RunStatus.MODEL_OUTPUT_TRUNCATED
+        assert backend.call_count == 3
+
+    def test_content_filter_returns_content_filtered_status(self, task, log, registry):
+        backend = ErrorBackend([
+            _llm_error("blocked", LLMContentFilteredError),
+        ])
+        agent = Agent(backend, registry)
+
+        result = agent.run(task, log)
+
+        assert result.status == RunStatus.CONTENT_FILTERED
+        assert "blocked" in result.summary
+        assert backend.call_count == 1
+
+    def test_provider_protocol_error_retries_then_returns_provider_error(
+        self,
+        task,
+        log,
+        registry,
+    ):
+        backend = ErrorBackend([
+            _llm_error("bad provider", LLMProviderProtocolError),
+            _llm_error("bad provider", LLMProviderProtocolError),
+        ])
+        config = AgentConfig(llm_max_retries=2, llm_retry_delay=0.01)
+        agent = Agent(backend, registry, config)
+
+        result = agent.run(task, log)
+
+        assert result.status == RunStatus.PROVIDER_ERROR
+        assert result.steps_taken == 1
+        assert result.total_tokens == 15
+        assert backend.call_count == 2
 
 
 # ---------------------------------------------------------------------------

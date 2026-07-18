@@ -19,7 +19,16 @@ import logging
 from typing import Any
 
 from agent.task import Action, ActionType, ToolCall
-from llm.base import LLMBackend, LLMMessage, LLMResponse, LLMToolSchema
+from llm.base import (
+    LLMBackend,
+    LLMContentFilteredError,
+    LLMMessage,
+    LLMModelBehaviorError,
+    LLMOutputTruncatedError,
+    LLMProviderProtocolError,
+    LLMResponse,
+    LLMToolSchema,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +104,16 @@ class OpenAICompatBackend(LLMBackend):
         )
         response = self._client.chat.completions.create(**kwargs)
 
+        input_tokens = response.usage.prompt_tokens
+        output_tokens = response.usage.completion_tokens
+
+        if not response.choices:
+            raise LLMProviderProtocolError(
+                "Response contains no choices",
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+            )
+
         choice = response.choices[0]
         message = getattr(choice, "message", None)
         content = getattr(message, "content", None)
@@ -106,20 +125,22 @@ class OpenAICompatBackend(LLMBackend):
         logger.debug(
             "OpenAI-compat response: finish_reason=%s input=%d output=%d",
             choice.finish_reason,
-            response.usage.prompt_tokens,
-            response.usage.completion_tokens,
+            input_tokens,
+            output_tokens,
         )
 
         action = _parse_openai_response(
             choice,
             fallback_reasoning=reasoning if isinstance(reasoning, str) else "",
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
         )
 
         return LLMResponse(
             action=action,
             raw_content=raw_content,
-            input_tokens=response.usage.prompt_tokens,
-            output_tokens=response.usage.completion_tokens,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
             assistant_message=_assistant_message_from_choice(choice),
         )
 
@@ -222,16 +243,25 @@ def _assistant_message_from_choice(choice: Any) -> LLMMessage | None:
     )
 
 
-def _parse_openai_response(choice: Any, fallback_reasoning: str = "") -> Action:
+def _parse_openai_response(
+    choice: Any,
+    fallback_reasoning: str = "",
+    *,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+) -> Action:
     """将 OpenAI-compatible API 的 choice 转换为内部 Action。"""
     finish_reason = getattr(choice, "finish_reason", None)
     message = getattr(choice, "message", None)
+    error_kwargs = {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+    }
 
     if message is None:
-        return Action(
-            action_type=ActionType.GIVE_UP,
-            thought=fallback_reasoning, # 这里其实为none
-            message="Response choice contains no message",
+        raise LLMProviderProtocolError(
+            "Response choice contains no message",
+            **error_kwargs,
         )
 
     content = getattr(message, "content", None)
@@ -250,13 +280,9 @@ def _parse_openai_response(choice: Any, fallback_reasoning: str = "") -> Action:
 
     if finish_reason == "tool_calls":
         if not tool_calls:
-            return Action(
-                action_type=ActionType.GIVE_UP,
-                thought=reasoning,
-                message=(
-                    "finish_reason was 'tool_calls', "
-                    "but no tool calls were provided"
-                ),
+            raise LLMModelBehaviorError(
+                "finish_reason was 'tool_calls', but no tool calls were provided",
+                **error_kwargs,
             )
 
         parsed_calls: list[ToolCall] = []
@@ -265,18 +291,14 @@ def _parse_openai_response(choice: Any, fallback_reasoning: str = "") -> Action:
             try:
                 params = json.loads(arguments)
             except json.JSONDecodeError as exc:
-                return Action(
-                    action_type=ActionType.GIVE_UP,
-                    thought=reasoning,
-                    message=f"Invalid tool arguments JSON: {exc}",
+                raise LLMModelBehaviorError(
+                    f"Invalid tool arguments JSON: {exc}",
+                    **error_kwargs,
                 )
-            # 这里其实有问题，应该让大模型重试，重试输出functional call
-            # todo
             if not isinstance(params, dict):
-                return Action(
-                    action_type=ActionType.GIVE_UP,
-                    thought=reasoning,
-                    message="Tool arguments must be a JSON object",
+                raise LLMModelBehaviorError(
+                    "Tool arguments must be a JSON object",
+                    **error_kwargs,
                 )
 
             parsed_calls.append(ToolCall(
@@ -299,30 +321,26 @@ def _parse_openai_response(choice: Any, fallback_reasoning: str = "") -> Action:
                 thought=reasoning,
                 message=content,
             )
-        return Action(
-            action_type=ActionType.GIVE_UP,
-            thought=reasoning,
-            message="Model stopped with no final content",
+        raise LLMModelBehaviorError(
+            "Model stopped with no final content",
+            **error_kwargs,
         )
 
     if finish_reason == "length":
-        return Action(
-            action_type=ActionType.GIVE_UP,
-            thought=reasoning,
-            message="Model output was truncated by the token limit",
+        raise LLMOutputTruncatedError(
+            "Model output was truncated by the token limit",
+            **error_kwargs,
         )
 
     if finish_reason == "content_filter":
-        return Action(
-            action_type=ActionType.GIVE_UP,
-            thought=reasoning,
-            message="Model output was blocked by the content filter",
+        raise LLMContentFilteredError(
+            "Model output was blocked by the content filter",
+            **error_kwargs,
         )
 
-    return Action(
-        action_type=ActionType.GIVE_UP,
-        thought=reasoning,
-        message=f"Unsupported finish_reason: {finish_reason!r}",
+    raise LLMProviderProtocolError(
+        f"Unsupported finish_reason: {finish_reason!r}",
+        **error_kwargs,
     )
 
 
@@ -442,6 +460,12 @@ def _stream_with_tools(self, api_messages, tools, on_text, on_thought=None):
             tool_calls=None,
         )
 
+    # 流式模式拿不到精确 token 数，估算
+    from context.token_budget import estimate_tokens
+    input_tokens = sum(estimate_tokens(m.get("content", "")) for m in api_messages)
+    output_tokens = estimate_tokens(full_text + full_reasoning)
+    raw_content = full_text or full_reasoning
+
     mock_choice = SimpleNamespace(
         finish_reason=finish_reason or "stop",
         message=mock_message,
@@ -449,16 +473,13 @@ def _stream_with_tools(self, api_messages, tools, on_text, on_thought=None):
     action = _parse_openai_response(
         mock_choice,
         fallback_reasoning=full_reasoning,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
     )
-
-    # 流式模式拿不到精确 token 数，估算
-    from context.token_budget import estimate_tokens
-    input_tokens = sum(estimate_tokens(m.get("content", "")) for m in api_messages)
-    output_tokens = estimate_tokens(full_text + full_reasoning)
 
     return LLMResponse(
         action=action,
-        raw_content=full_text or full_reasoning,
+        raw_content=raw_content,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         assistant_message=_assistant_message_from_choice(mock_choice),

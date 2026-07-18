@@ -101,7 +101,13 @@ def _build_registry(cfg, confirm_callback=None, runtime=None, repo_path=None):
     )
 
 
-def _print_step(event) -> None:
+def _message_was_streamed(message: str, streamed_text: str) -> bool:
+    msg = message.strip()
+    streamed = streamed_text.strip()
+    return bool(msg and (streamed == msg or streamed.endswith(msg)))
+
+
+def _print_step(event, *, streamed_text: str = "") -> None:
     """实时打印单条 event。"""
     from agent.task import EventType
     etype = event.event_type
@@ -154,7 +160,11 @@ def _print_step(event) -> None:
         click.echo(yellow(f"\n  ⟳ Reflection: {payload.get('reason', '')}\n"))
 
     elif etype == EventType.TASK_COMPLETE:
-        click.echo(green(bold(f"\n✓ COMPLETE: {payload.get('summary', '')}\n")))
+        summary = payload.get("summary", "")
+        if _message_was_streamed(summary, streamed_text):
+            click.echo(green(bold("\n✓ COMPLETE\n")))
+        else:
+            click.echo(green(bold(f"\n✓ COMPLETE: {summary}\n")))
 
     elif etype == EventType.TASK_FAILED:
         click.echo(red(bold(f"\n✗ FAILED: {payload.get('reason', '')}\n")))
@@ -277,9 +287,12 @@ def run(
     except ImportError:
         is_tiktoken_available = lambda: False
 
+    streamed_text_parts: list[str] = []
+
     # 流式回调：最终回答正常亮色
     def _stream_cb(text: str) -> None:
         import sys
+        streamed_text_parts.append(text)
         sys.stdout.write(text)
         sys.stdout.flush()
 
@@ -332,8 +345,9 @@ def run(
             click.echo(dim(f"  Log: {log.path}\n"))
             result = agent.run(task_obj, log)
             # 打印所有 events
+            streamed_text = "".join(streamed_text_parts) if stream else ""
             for event in log.replay():
-                _print_step(event)
+                _print_step(event, streamed_text=streamed_text)
     finally:
         if getattr(tracer, "flush_on_exit", False):
             tracer.flush()

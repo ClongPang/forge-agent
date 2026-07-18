@@ -50,10 +50,15 @@ class ObservationStatus(str, Enum):
 
 class RunStatus(str, Enum):
     """整次 agent 运行的最终状态。"""
-    SUCCESS     = "success"
-    FAILED      = "failed"
-    MAX_STEPS   = "max_steps"    # 达到步数上限
-    GAVE_UP     = "gave_up"      # agent 主动放弃
+    SUCCESS                = "success"
+    FAILED                 = "failed"
+    MAX_STEPS              = "max_steps"               # 达到步数上限
+    GAVE_UP                = "gave_up"                 # agent 主动放弃
+    LOOP_DETECTED          = "loop_detected"           # 连续重复 action 熔断
+    MODEL_OUTPUT_INVALID   = "model_output_invalid"    # 模型输出不满足 action contract
+    MODEL_OUTPUT_TRUNCATED = "model_output_truncated"  # 模型输出被 token 上限截断
+    CONTENT_FILTERED       = "content_filtered"        # 模型输出被安全过滤
+    PROVIDER_ERROR         = "provider_error"          # provider 返回不符合协议或持续异常
 
 
 # ---------------------------------------------------------------------------

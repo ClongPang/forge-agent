@@ -33,6 +33,8 @@ from agent.prompt import (
     build_system_prompt,
     build_task_prompt,
     reflection_finish_tool_markers,
+    reflection_model_output_invalid,
+    reflection_model_output_truncated,
     reflection_no_edit,
     reflection_test_failed,
 )
@@ -40,7 +42,15 @@ from agent.task import (
     Action, ActionType, Event, EventType,
     Observation, ObservationStatus, RunResult, RunStatus, Task, ToolCall,
 )
-from llm.base import LLMBackend, LLMMessage, LLMToolSchema
+from llm.base import (
+    LLMBackend,
+    LLMContentFilteredError,
+    LLMMessage,
+    LLMModelBehaviorError,
+    LLMOutputTruncatedError,
+    LLMProviderProtocolError,
+    LLMToolSchema,
+)
 from tools.base import ToolRegistry, ToolResult
 from tools.security_policy import ToolPolicy, resolve_repo_path, is_inside
 
@@ -65,6 +75,7 @@ class AgentConfig:
     history_max_messages: int = 40         # 历史最大条数
     llm_max_retries: int = 3               # LLM 调用失败最大重试次数
     llm_retry_delay: float = 2.0           # 重试间隔（秒，指数退避）
+    model_output_repair_max_attempts: int = 2  # 模型输出 contract 错误的修复次数
     stream: bool = False                   # 是否启用流式输出
     stream_callback: object = None         # StreamCallback，最终回答流式回调
     thought_callback: object = None        # StreamCallback，推理过程流式回调（推理模型专用）
@@ -126,6 +137,31 @@ class Agent:
             tracer.finish_run(result)
             return result
 
+        def _fail_run(
+            *,
+            step: int,
+            status: RunStatus,
+            reason: str,
+            failure_stage: str,
+            error: str | None = None,
+        ) -> RunResult:
+            log.log_task_failed(steps=step, reason=reason)
+            result = RunResult(
+                task_id=task.task_id,
+                status=status,
+                summary=reason,
+                steps_taken=step,
+                total_tokens=total_tokens,
+                error=error,
+            )
+            metadata = {"step": step, "failure_stage": failure_stage}
+            tracer.record_event(
+                "task.failed",
+                output=result.to_dict(),
+                metadata=metadata,
+            )
+            return _finish(result)
+
         try:
             self._current_repo_path = task.repo_path
             # 按 repo_path 隔离 repo_map 缓存，换 repo 时自动重建
@@ -156,6 +192,73 @@ class Agent:
             total_tokens = 0
             steps_without_edit = 0
             modified_files: set = set()
+            model_output_repair_attempts = 0
+
+            def _handle_repairable_model_error(
+                step: int,
+                exc: LLMModelBehaviorError | LLMOutputTruncatedError,
+            ) -> RunResult | None:
+                nonlocal model_output_repair_attempts, total_tokens
+
+                total_tokens += exc.total_tokens
+                is_truncated = isinstance(exc, LLMOutputTruncatedError)
+                reason = (
+                    "model_output_truncated"
+                    if is_truncated
+                    else "model_output_invalid"
+                )
+                status = (
+                    RunStatus.MODEL_OUTPUT_TRUNCATED
+                    if is_truncated
+                    else RunStatus.MODEL_OUTPUT_INVALID
+                )
+
+                if model_output_repair_attempts < self._cfg.model_output_repair_max_attempts:
+                    model_output_repair_attempts += 1
+                    reflect_prompt = (
+                        reflection_model_output_truncated(str(exc))
+                        if is_truncated
+                        else reflection_model_output_invalid(str(exc))
+                    )
+                    log.log_reflection(
+                        step=step,
+                        reason=reason,
+                        prompt=reflect_prompt,
+                    )
+                    tracer.record_event(
+                        "reflection.triggered",
+                        input={"prompt": reflect_prompt},
+                        metadata={
+                            "step": step,
+                            "reason": reason,
+                            "error_type": type(exc).__name__,
+                            "repair_attempt": model_output_repair_attempts,
+                            "max_repair_attempts": (
+                                self._cfg.model_output_repair_max_attempts
+                            ),
+                        },
+                    )
+                    history.add(LLMMessage(role="user", content=reflect_prompt))
+                    logger.warning(
+                        "Model output repair triggered at step %d "
+                        "(attempt %d/%d): %s",
+                        step,
+                        model_output_repair_attempts,
+                        self._cfg.model_output_repair_max_attempts,
+                        exc,
+                    )
+                    return None
+
+                return _fail_run(
+                    step=step,
+                    status=status,
+                    reason=(
+                        "Model output repair attempts exhausted "
+                        f"({self._cfg.model_output_repair_max_attempts}): {exc}"
+                    ),
+                    failure_stage=reason,
+                    error=str(exc),
+                )
 
             for step in range(1, task.max_steps + 1):
                 logger.debug("Step %d/%d", step, task.max_steps)
@@ -183,23 +286,42 @@ class Agent:
                                 "output_tokens": response.output_tokens,
                             },
                         )
+                except (LLMModelBehaviorError, LLMOutputTruncatedError) as exc:
+                    result = _handle_repairable_model_error(step, exc)
+                    if result is not None:
+                        return result
+                    continue
+                except LLMContentFilteredError as exc:
+                    total_tokens += exc.total_tokens
+                    logger.error("LLM output content filtered at step %d: %s", step, exc)
+                    return _fail_run(
+                        step=step,
+                        status=RunStatus.CONTENT_FILTERED,
+                        reason=str(exc),
+                        failure_stage="content_filtered",
+                        error=str(exc),
+                    )
+                except LLMProviderProtocolError as exc:
+                    total_tokens += exc.total_tokens
+                    logger.error("LLM provider protocol error at step %d: %s", step, exc)
+                    return _fail_run(
+                        step=step,
+                        status=RunStatus.PROVIDER_ERROR,
+                        reason=f"Provider protocol error: {exc}",
+                        failure_stage="provider_error",
+                        error=str(exc),
+                    )
                 except Exception as exc:
                     logger.error("LLM call failed at step %d after retries: %s", step, exc)
-                    log.log_task_failed(steps=step, reason=f"LLM error: {exc}")
-                    tracer.record_event(
-                        "task.failed",
-                        output={"reason": f"LLM error: {exc}"},
-                        metadata={"step": step, "failure_stage": "llm"},
-                    )
-                    return _finish(RunResult(
-                        task_id=task.task_id,
+                    return _fail_run(
+                        step=step,
                         status=RunStatus.FAILED,
-                        summary=f"LLM call failed: {exc}",
-                        steps_taken=step,
-                        total_tokens=total_tokens,
+                        reason=f"LLM call failed: {exc}",
+                        failure_stage="llm",
                         error=str(exc),
-                    ))
+                    )
 
+                model_output_repair_attempts = 0
                 total_tokens += response.total_tokens
                 action = response.action
 
@@ -211,19 +333,17 @@ class Agent:
                 if self._is_looping(log):
                     reason = f"Loop detected: same action repeated {self._cfg.loop_detection_window} times"
                     logger.warning(reason)
-                    log.log_task_failed(steps=step, reason=reason)
                     tracer.record_event(
                         "loop.detected",
                         output={"reason": reason},
                         metadata={"step": step, "window": self._cfg.loop_detection_window},
                     )
-                    return _finish(RunResult(
-                        task_id=task.task_id,
-                        status=RunStatus.GAVE_UP,
-                        summary=reason,
-                        steps_taken=step,
-                        total_tokens=total_tokens,
-                    ))
+                    return _fail_run(
+                        step=step,
+                        status=RunStatus.LOOP_DETECTED,
+                        reason=reason,
+                        failure_stage="loop_detected",
+                    )
 
                 # ── 4. 终止 action ──────────────────────────────────────────
                 if action.action_type == ActionType.FINISH:
@@ -269,20 +389,12 @@ class Agent:
 
                 if action.action_type == ActionType.GIVE_UP:
                     reason = action.message or "Agent gave up."
-                    log.log_task_failed(steps=step, reason=reason)
-                    result = RunResult(
-                        task_id=task.task_id,
+                    return _fail_run(
+                        step=step,
                         status=RunStatus.GAVE_UP,
-                        summary=reason,
-                        steps_taken=step,
-                        total_tokens=total_tokens,
+                        reason=reason,
+                        failure_stage="give_up",
                     )
-                    tracer.record_event(
-                        "task.failed",
-                        output=result.to_dict(),
-                        metadata={"step": step, "failure_stage": "give_up"},
-                    )
-                    return _finish(result)
 
                 # ── 5. 执行工具 ─────────────────────────────────────────────
                 tool_calls = action.iter_tool_calls()
@@ -394,20 +506,12 @@ class Agent:
 
             # ── 7. 超出步数上限 ─────────────────────────────────────────────
             reason = f"Reached max_steps limit ({task.max_steps})"
-            log.log_task_failed(steps=task.max_steps, reason=reason)
-            result = RunResult(
-                task_id=task.task_id,
+            return _fail_run(
+                step=task.max_steps,
                 status=RunStatus.MAX_STEPS,
-                summary=reason,
-                steps_taken=task.max_steps,
-                total_tokens=total_tokens,
+                reason=reason,
+                failure_stage="max_steps",
             )
-            tracer.record_event(
-                "task.failed",
-                output=result.to_dict(),
-                metadata={"failure_stage": "max_steps"},
-            )
-            return _finish(result)
         except BaseException as exc:
             tracer.record_event(
                 "task.exception",
@@ -596,7 +700,8 @@ class Agent:
         """
         带指数退避重试的 LLM 调用。
         stream=True 时走 backend.stream()，否则走 complete()。
-        不重试：认证失败（401/403）、参数错误（400）。
+        API retry 只处理网络、瞬时 provider 错误和可重试协议错误。
+        模型输出 contract 错误交给 run() 的 repair loop。
         """
         import time as _time
 
@@ -615,6 +720,25 @@ class Agent:
                             on_thought=thought_cb,
                         )
                 return self._backend.complete(messages, tools)
+            except (
+                LLMModelBehaviorError,
+                LLMOutputTruncatedError,
+                LLMContentFilteredError,
+            ):
+                raise
+            except LLMProviderProtocolError as exc:
+                last_exc = exc
+                if attempt < self._cfg.llm_max_retries:
+                    logger.warning(
+                        "LLM provider response invalid (attempt %d/%d): %s "
+                        "— retrying in %.1fs",
+                        attempt,
+                        self._cfg.llm_max_retries,
+                        exc,
+                        delay,
+                    )
+                    _time.sleep(delay)
+                    delay *= 2
             except Exception as exc:
                 last_exc = exc
                 exc_str = str(exc).lower()

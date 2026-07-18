@@ -150,6 +150,34 @@ def reflection_finish_tool_markers() -> str:
     return REFLECTION_FINISH_TOOL_MARKERS
 
 
+REFLECTION_MODEL_OUTPUT_INVALID = """\
+[REFLECTION] Your previous output did not satisfy the required action contract.
+Error: {error}
+
+Regenerate exactly one valid next step:
+- call one available tool with JSON object arguments matching its schema, or
+- call finish with non-empty final content if the task is complete.\
+"""
+
+
+def reflection_model_output_invalid(error: str) -> str:
+    return REFLECTION_MODEL_OUTPUT_INVALID.format(error=error)
+
+
+REFLECTION_MODEL_OUTPUT_TRUNCATED = """\
+[REFLECTION] Your previous output was truncated by the token limit.
+Error: {error}
+
+Continue with a shorter valid next step:
+- call one available tool with JSON object arguments matching its schema, or
+- call finish with a concise non-empty final answer if the task is complete.\
+"""
+
+
+def reflection_model_output_truncated(error: str) -> str:
+    return REFLECTION_MODEL_OUTPUT_TRUNCATED.format(error=error)
+
+
 def reflection_loop_detected(n: int) -> str:
     return REFLECTION_LOOP_DETECTED.format(n=n)
 

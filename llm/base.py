@@ -65,6 +65,46 @@ class LLMResponse:
         return self.input_tokens + self.output_tokens
 
 
+class LLMResponseError(Exception):
+    """
+    LLM backend 返回内容不满足 harness contract 时使用的基类。
+
+    这些错误不是有效的 agent action；core.py 根据具体类型决定
+    API retry、model repair 或终止状态。
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+    ) -> None:
+        super().__init__(message)
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
+
+    @property
+    def total_tokens(self) -> int:
+        return self.input_tokens + self.output_tokens
+
+
+class LLMModelBehaviorError(LLMResponseError):
+    """模型输出结构错误，但通常可通过反馈提示让模型修复。"""
+
+
+class LLMProviderProtocolError(LLMResponseError):
+    """provider 返回结构与 API contract 不一致。"""
+
+
+class LLMOutputTruncatedError(LLMResponseError):
+    """模型输出被 token 上限截断。"""
+
+
+class LLMContentFilteredError(LLMResponseError):
+    """模型输出被安全过滤或拒绝返回。"""
+
+
 # ---------------------------------------------------------------------------
 # 抽象基类
 # ---------------------------------------------------------------------------
