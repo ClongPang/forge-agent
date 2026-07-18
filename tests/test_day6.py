@@ -14,10 +14,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 from click.testing import CliRunner
 
+from agent.task import Action, ActionType, Event, EventType, ToolCall
 from config.schema import (
-    AppConfig, load_config, merge_cli_overrides, _expand_env, _parse,
+    AppConfig, load_config, merge_cli_overrides, _expand_env, _parse, _parse_bool,
 )
-from entry.cli import cli
+from entry.cli import cli, _print_step
 
 
 # ===========================================================================
@@ -42,13 +43,28 @@ class TestExpandEnv:
         assert _expand_env("${A}-${B}") == "foo-bar"
 
 
+class TestParseBool:
+    def test_string_false_is_false(self):
+        assert _parse_bool("false", True) is False
+        assert _parse_bool("0", True) is False
+        assert _parse_bool("off", True) is False
+
+    def test_string_true_is_true(self):
+        assert _parse_bool("true", False) is True
+        assert _parse_bool("1", False) is True
+        assert _parse_bool("on", False) is True
+
+
 class TestParseConfig:
     def test_defaults_when_empty(self):
         config = _parse({})
-        assert config.llm.provider == "anthropic"
+        assert config.llm.provider == "deepseek"
+        assert config.llm.model == "deepseek-v4-pro"
         assert config.agent.max_steps == 40
         assert config.tools.shell.timeout == 30
         assert config.context.history_window == 20
+        assert config.observability.langfuse.enabled is False
+        assert config.observability.langfuse.trace_content == "full"
 
     def test_llm_section(self):
         config = _parse({"llm": {"provider": "deepseek", "model": "deepseek-chat"}})
@@ -71,11 +87,48 @@ class TestParseConfig:
     def test_partial_section_uses_defaults(self):
         config = _parse({"llm": {"provider": "openai"}})
         assert config.llm.provider == "openai"
-        assert config.llm.model == "claude-sonnet-4-5"   # default
+        assert config.llm.model == "deepseek-v4-pro"   # default
 
     def test_base_url_none_becomes_empty(self):
         config = _parse({"llm": {"base_url": None}})
         assert config.llm.base_url == ""
+
+    def test_observability_langfuse_section(self):
+        config = _parse({
+            "observability": {
+                "langfuse": {
+                    "enabled": True,
+                    "base_url": "https://cloud.langfuse.com",
+                    "public_key": "pk-test",
+                    "secret_key": "sk-test",
+                    "trace_content": "full",
+                    "flush_on_exit": False,
+                    "debug": True,
+                }
+            }
+        })
+        lf = config.observability.langfuse
+        assert lf.enabled is True
+        assert lf.base_url == "https://cloud.langfuse.com"
+        assert lf.public_key == "pk-test"
+        assert lf.secret_key == "sk-test"
+        assert lf.flush_on_exit is False
+        assert lf.debug is True
+
+    def test_observability_langfuse_boolean_strings(self):
+        config = _parse({
+            "observability": {
+                "langfuse": {
+                    "enabled": "false",
+                    "flush_on_exit": "false",
+                    "debug": "true",
+                }
+            }
+        })
+        lf = config.observability.langfuse
+        assert lf.enabled is False
+        assert lf.flush_on_exit is False
+        assert lf.debug is True
 
 
 class TestLoadConfig:
@@ -102,10 +155,30 @@ agent:
         config = load_config(config_file)
         assert config.llm.api_key == "sk-from-env"
 
+    def test_dotenv_file_loaded_before_expansion(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("TEST_DOTENV_API_KEY", raising=False)
+        (tmp_path / ".env").write_text("TEST_DOTENV_API_KEY=sk-from-dotenv\n")
+        config_file = tmp_path / "test.yaml"
+        config_file.write_text("llm:\n  api_key: ${TEST_DOTENV_API_KEY}\n")
+
+        config = load_config(config_file)
+
+        assert config.llm.api_key == "sk-from-dotenv"
+
+    def test_dotenv_does_not_override_exported_env(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("TEST_DOTENV_API_KEY", "sk-from-shell")
+        (tmp_path / ".env").write_text("TEST_DOTENV_API_KEY=sk-from-dotenv\n")
+        config_file = tmp_path / "test.yaml"
+        config_file.write_text("llm:\n  api_key: ${TEST_DOTENV_API_KEY}\n")
+
+        config = load_config(config_file)
+
+        assert config.llm.api_key == "sk-from-shell"
+
     def test_missing_file_returns_defaults(self, tmp_path):
         config = load_config(tmp_path / "nonexistent.yaml")
         assert isinstance(config, AppConfig)
-        assert config.llm.provider == "anthropic"
+        assert config.llm.provider == "deepseek"
 
     def test_none_path_returns_defaults(self, tmp_path, monkeypatch):
         # 确保当前目录没有 default.yaml
@@ -174,6 +247,17 @@ class TestCliHelp:
         runner = CliRunner()
         result = runner.invoke(cli, ["log", "list", "--help"])
         assert result.exit_code == 0
+
+    def test_eval_help(self):
+        runner = CliRunner()
+        result = runner.invoke(cli, ["eval", "--help"])
+        assert result.exit_code == 0
+
+    def test_eval_add_trace_help(self):
+        runner = CliRunner()
+        result = runner.invoke(cli, ["eval", "add-trace", "--help"])
+        assert result.exit_code == 0
+        assert "trace" in result.output.lower()
 
 
 class TestCliRun:
@@ -258,6 +342,91 @@ class TestCliRun:
                 ], obj={})
         assert result.exit_code == 0
 
+    def test_run_flushes_tracer_on_exit(self, tmp_path):
+        from agent.telemetry import AgentTracer
+        from agent.task import Action, ActionType
+        from llm.base import MockBackend
+
+        class FlushTracer(AgentTracer):
+            flush_on_exit = True
+
+            def __init__(self):
+                self.flush_count = 0
+
+            def flush(self):
+                self.flush_count += 1
+
+        tracer = FlushTracer()
+        mock_backend = MockBackend([
+            Action(ActionType.FINISH, "done", message="Task complete")
+        ])
+
+        runner = CliRunner()
+        with patch("entry.cli.create_backend_from_config", return_value=mock_backend):
+            with patch("entry.cli.load_config") as mock_cfg:
+                from config.schema import AppConfig
+                cfg = AppConfig()
+                cfg.agent.log_dir = str(tmp_path / "logs")
+                mock_cfg.return_value = cfg
+                with patch(
+                    "agent.telemetry.build_tracer_from_config",
+                    return_value=tracer,
+                ):
+                    result = runner.invoke(cli, [
+                        "run",
+                        "--repo", str(tmp_path),
+                        "--task", "fix it",
+                    ], obj={})
+
+        assert result.exit_code == 0, result.output
+        assert tracer.flush_count == 1
+
+
+class TestPrintStep:
+    def test_give_up_action_is_not_printed_twice(self, capsys):
+        action = Action(
+            ActionType.GIVE_UP,
+            "stuck",
+            message="cannot solve",
+        )
+
+        _print_step(Event(
+            event_type=EventType.ACTION,
+            task_id="t",
+            payload={"step": 1, "action": action.to_dict()},
+        ))
+        _print_step(Event(
+            event_type=EventType.TASK_FAILED,
+            task_id="t",
+            payload={"steps": 1, "reason": "cannot solve"},
+        ))
+
+        out = capsys.readouterr().out
+        assert "[Step 1] give_up" not in out
+        assert "FAILED: cannot solve" in out
+
+    def test_multiple_tool_calls_show_step_index_labels(self, capsys):
+        calls = [
+            ToolCall("shell", {"cmd": "ls"}, id="call_1"),
+            ToolCall("test", {}, id="call_2"),
+        ]
+        action = Action(
+            action_type=ActionType.TOOL_CALL,
+            thought="run both",
+            tool_call=calls[0],
+            tool_calls=calls,
+        )
+
+        _print_step(Event(
+            event_type=EventType.ACTION,
+            task_id="t",
+            payload={"step": 1, "action": action.to_dict()},
+        ))
+
+        out = capsys.readouterr().out
+        assert "Tool[1.1]: shell" in out
+        assert "Tool[1.2]: test" in out
+
 
 class TestCliLog:
     def test_log_show(self, tmp_path):
@@ -304,6 +473,53 @@ class TestCliLog:
         result = runner.invoke(cli, ["log", "list", "--dir", str(log_dir)], obj={})
         assert result.exit_code == 0
         assert "No log files" in result.output
+
+
+class TestCliEval:
+    def test_eval_add_trace_calls_dataset_helper(self):
+        from agent.eval_dataset import DatasetAddResult
+
+        helper_result = DatasetAddResult(
+            dataset_name="forge-agent/regression",
+            dataset_item_id="item-1",
+            trace_id="trace-1",
+            source_observation_id="root-observation",
+            focused_observation_id="generation-observation",
+            failure_type="premature_finish",
+            created_dataset=True,
+        )
+
+        runner = CliRunner()
+        with patch("entry.cli.load_config", return_value=AppConfig()) as mock_load:
+            with patch(
+                "agent.eval_dataset.add_trace_to_dataset",
+                return_value=helper_result,
+            ) as mock_add:
+                result = runner.invoke(cli, [
+                    "--config", "config/langfuse.yaml",
+                    "eval",
+                    "add-trace",
+                    "trace-1",
+                    "--dataset", "forge-agent/regression",
+                    "--source-observation-id", "root-observation",
+                    "--focused-observation-id", "generation-observation",
+                    "--failure-type", "premature_finish",
+                    "--notes", "bad final",
+                ], obj={})
+
+        assert result.exit_code == 0, result.output
+        assert "Added Langfuse trace to dataset" in result.output
+        assert "item-1" in result.output
+        assert "trace-1" in result.output
+        mock_load.assert_called_once_with("config/langfuse.yaml")
+        mock_add.assert_called_once()
+        _, kwargs = mock_add.call_args
+        assert kwargs["dataset_name"] == "forge-agent/regression"
+        assert kwargs["source_observation_id"] == "root-observation"
+        assert kwargs["focused_observation_id"] == "generation-observation"
+        assert kwargs["failure_type"] == "premature_finish"
+        assert kwargs["notes"] == "bad final"
+        assert kwargs["create_dataset"] is True
 
 
 # ===========================================================================

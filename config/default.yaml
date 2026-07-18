@@ -20,3 +20,13 @@ tools:
 context:
   repo_map_budget: 8000 # repo-map 最大 token 数
   history_window: 20 # 保留最近 N 轮对话
+
+observability:
+  langfuse:
+    enabled: true
+    base_url: ${LANGFUSE_BASE_URL}
+    public_key: ${LANGFUSE_PUBLIC_KEY}
+    secret_key: ${LANGFUSE_SECRET_KEY}
+    trace_content: full
+    flush_on_exit: true
+    debug: false

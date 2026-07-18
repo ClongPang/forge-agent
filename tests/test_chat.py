@@ -10,10 +10,19 @@ from pathlib import Path
 
 import pytest
 
-from agent.task import Action, ActionType, Task, ToolCall
+from agent.task import (
+    Action,
+    ActionType,
+    Event,
+    EventType,
+    Observation,
+    ObservationStatus,
+    Task,
+    ToolCall,
+)
 from config.schema import AppConfig
 from context.history import ConversationHistory
-from entry.chat import ChatSession
+from entry.chat import ChatSession, _print_event_live
 from llm.base import LLMMessage, MockBackend
 from tools.base import NoopTool, ToolRegistry
 
@@ -215,6 +224,95 @@ class TestChatEdgeCases:
 
         # repo_map 只构建一次（第一轮），第二轮复用缓存
         assert build_count == 1
+
+
+# ---------------------------------------------------------------------------
+# 实时输出
+# ---------------------------------------------------------------------------
+
+class TestLiveOutput:
+    def _reset_live_state(self):
+        for attr in (
+            "_pending_message",
+            "_streamed_thought",
+            "_pending_tool_names",
+            "_multi_tool_step",
+        ):
+            if hasattr(_print_event_live, attr):
+                delattr(_print_event_live, attr)
+
+    def test_give_up_prints_only_final_failure(self, capsys):
+        self._reset_live_state()
+        action = Action(
+            ActionType.GIVE_UP,
+            "stuck",
+            message="cannot solve",
+        )
+
+        _print_event_live(Event(
+            event_type=EventType.ACTION,
+            task_id="t",
+            payload={"step": 1, "action": action.to_dict()},
+        ))
+        _print_event_live(Event(
+            event_type=EventType.TASK_FAILED,
+            task_id="t",
+            payload={"steps": 1, "reason": "cannot solve"},
+        ))
+
+        out = capsys.readouterr().out
+        assert "✗ give_up" not in out
+        assert "Failed: cannot solve" in out
+
+    def test_multi_tool_output_pairs_observations_by_queue(self, capsys):
+        self._reset_live_state()
+        calls = [
+            ToolCall("shell", {"cmd": "ls"}, id="call_1"),
+            ToolCall("test", {}, id="call_2"),
+        ]
+        action = Action(
+            action_type=ActionType.TOOL_CALL,
+            thought="run both",
+            tool_call=calls[0],
+            tool_calls=calls,
+        )
+
+        _print_event_live(Event(
+            event_type=EventType.ACTION,
+            task_id="t",
+            payload={"step": 1, "action": action.to_dict()},
+        ))
+        _print_event_live(Event(
+            event_type=EventType.OBSERVATION,
+            task_id="t",
+            payload={
+                "step": 1,
+                "observation": Observation(
+                    status=ObservationStatus.SUCCESS,
+                    output="ok",
+                    tool_name="shell",
+                ).to_dict(),
+            },
+        ))
+        _print_event_live(Event(
+            event_type=EventType.OBSERVATION,
+            task_id="t",
+            payload={
+                "step": 1,
+                "observation": Observation(
+                    status=ObservationStatus.ERROR,
+                    output="failed",
+                    tool_name="test",
+                    error="failed",
+                ).to_dict(),
+            },
+        ))
+
+        out = capsys.readouterr().out
+        assert "[1.1] shell" in out
+        assert "[1.2] test" in out
+        assert "✓ [shell]" in out
+        assert "✗ [test] failed" in out
 
 
 # ---------------------------------------------------------------------------

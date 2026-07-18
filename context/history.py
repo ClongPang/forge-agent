@@ -56,13 +56,32 @@ class ConversationHistory:
 
     def to_dicts(self) -> list[dict]:
         """转为 dict 列表，供 TokenBudget.trim_history() 使用。"""
-        return [{"role": m.role, "content": m.content} for m in self._messages]
+        result = []
+        for m in self._messages:
+            item = {"role": m.role, "content": m.content}
+            if m.tool_call_id is not None:
+                item["tool_call_id"] = m.tool_call_id
+            if m.reasoning_content is not None:
+                item["reasoning_content"] = m.reasoning_content
+            if m.tool_calls is not None:
+                item["tool_calls"] = m.tool_calls
+            result.append(item)
+        return result
 
     @classmethod
     def from_dicts(cls, dicts: list[dict], max_messages: int = 40) -> "ConversationHistory":
         """从 dict 列表恢复（断点续跑时用）。"""
         h = cls(max_messages=max_messages)
-        h._messages = [LLMMessage(role=d["role"], content=d["content"]) for d in dicts]
+        h._messages = [
+            LLMMessage(
+                role=d["role"],
+                content=d.get("content", ""),
+                tool_call_id=d.get("tool_call_id"),
+                reasoning_content=d.get("reasoning_content"),
+                tool_calls=d.get("tool_calls"),
+            )
+            for d in dicts
+        ]
         return h
 
     @property

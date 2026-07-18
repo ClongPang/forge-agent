@@ -26,8 +26,8 @@ import yaml
 
 @dataclass
 class LLMConfig:
-    provider: str = "anthropic"
-    model: str = "claude-sonnet-4-5"
+    provider: str = "deepseek"
+    model: str = "deepseek-v4-pro"
     api_key: str = ""
     base_url: str = ""
     max_tokens: int = 4096
@@ -64,11 +64,28 @@ class ContextConfig:
 
 
 @dataclass
+class LangfuseConfig:
+    enabled: bool = False
+    base_url: str = ""
+    public_key: str = ""
+    secret_key: str = ""
+    trace_content: str = "full"
+    flush_on_exit: bool = True
+    debug: bool = False
+
+
+@dataclass
+class ObservabilityConfig:
+    langfuse: LangfuseConfig = field(default_factory=LangfuseConfig)
+
+
+@dataclass
 class AppConfig:
     llm: LLMConfig = field(default_factory=LLMConfig)
     agent: AgentCfg = field(default_factory=AgentCfg)
     tools: ToolsConfig = field(default_factory=ToolsConfig)
     context: ContextConfig = field(default_factory=ContextConfig)
+    observability: ObservabilityConfig = field(default_factory=ObservabilityConfig)
 
 
 # ---------------------------------------------------------------------------
@@ -76,6 +93,63 @@ class AppConfig:
 # ---------------------------------------------------------------------------
 
 _ENV_RE = re.compile(r"\$\{(\w+)\}")
+_ENV_LINE_RE = re.compile(r"(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)")
+
+
+def _dotenv_candidates(config_path: Path | None = None) -> list[Path]:
+    candidates = [Path.cwd() / ".env"]
+    if config_path is not None:
+        candidates.append(config_path.parent / ".env")
+    candidates.append(Path(__file__).parent.parent / ".env")
+
+    seen: set[Path] = set()
+    unique: list[Path] = []
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            unique.append(resolved)
+    return unique
+
+
+def _parse_dotenv_value(raw: str) -> str:
+    value = raw.strip()
+    if not value:
+        return ""
+    if value[0] in {"'", '"'}:
+        quote = value[0]
+        end = value.find(quote, 1)
+        if end == -1:
+            inner = value[1:]
+        else:
+            inner = value[1:end]
+        if quote == '"':
+            inner = (
+                inner
+                .replace(r"\n", "\n")
+                .replace(r"\r", "\r")
+                .replace(r"\t", "\t")
+                .replace(r'\"', '"')
+                .replace(r"\\", "\\")
+            )
+        return inner
+    return re.split(r"\s+#", value, maxsplit=1)[0].strip()
+
+
+def _load_dotenv(config_path: Path | None = None) -> None:
+    for env_path in _dotenv_candidates(config_path):
+        if not env_path.is_file():
+            continue
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            match = _ENV_LINE_RE.fullmatch(stripped)
+            if not match:
+                continue
+            key, raw_value = match.groups()
+            if key not in os.environ:
+                os.environ[key] = _parse_dotenv_value(raw_value)
 
 
 def _expand_env(text: str) -> str:
@@ -83,6 +157,22 @@ def _expand_env(text: str) -> str:
     def replace(m: re.Match) -> str:
         return os.environ.get(m.group(1), "")
     return _ENV_RE.sub(replace, text)
+
+
+def _parse_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off", ""}:
+            return False
+    return bool(value)
 
 
 def load_config(path: str | Path | None = None) -> AppConfig:
@@ -95,6 +185,9 @@ def load_config(path: str | Path | None = None) -> AppConfig:
     Returns:
         AppConfig 实例
     """
+    config_path: Path | None = Path(path) if path is not None else None
+    _load_dotenv(config_path)
+
     if path is None:
         # 自动查找：当前目录 → 项目根目录
         candidates = [
@@ -123,10 +216,11 @@ def _parse(data: dict[str, Any]) -> AppConfig:
     agent_raw = data.get("agent", {})
     tools_raw = data.get("tools", {})
     context_raw = data.get("context", {})
+    observability_raw = data.get("observability", {})
 
     llm = LLMConfig(
-        provider=llm_raw.get("provider", "anthropic"),
-        model=llm_raw.get("model", "claude-sonnet-4-5"),
+        provider=llm_raw.get("provider", "deepseek"),
+        model=llm_raw.get("model", "deepseek-v4-pro"),
         api_key=llm_raw.get("api_key", ""),
         base_url=llm_raw.get("base_url", "") or "",
         max_tokens=int(llm_raw.get("max_tokens", 4096)),
@@ -155,7 +249,26 @@ def _parse(data: dict[str, Any]) -> AppConfig:
         history_window=int(context_raw.get("history_window", 20)),
     )
 
-    return AppConfig(llm=llm, agent=agent, tools=tools, context=context)
+    langfuse_raw = observability_raw.get("langfuse", {})
+    observability = ObservabilityConfig(
+        langfuse=LangfuseConfig(
+            enabled=_parse_bool(langfuse_raw.get("enabled"), False),
+            base_url=langfuse_raw.get("base_url", "") or "",
+            public_key=langfuse_raw.get("public_key", "") or "",
+            secret_key=langfuse_raw.get("secret_key", "") or "",
+            trace_content=langfuse_raw.get("trace_content", "full") or "full",
+            flush_on_exit=_parse_bool(langfuse_raw.get("flush_on_exit"), True),
+            debug=_parse_bool(langfuse_raw.get("debug"), False),
+        )
+    )
+
+    return AppConfig(
+        llm=llm,
+        agent=agent,
+        tools=tools,
+        context=context,
+        observability=observability,
+    )
 
 
 def merge_cli_overrides(

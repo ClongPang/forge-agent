@@ -96,6 +96,7 @@ class ToolCall:
     """
     name: str                   # 工具名称，如 "shell", "file_read"
     params: dict[str, Any]      # 工具参数，由各 Tool 自己定义 schema
+    id: str | None = None       # provider 返回的原生 tool_call id（如 OpenAI/DeepSeek）
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -115,15 +116,26 @@ class Action:
     thought: str                            # LLM 的推理过程，必须保留，调试关键
     tool_call: ToolCall | None = None       # action_type == TOOL_CALL 时非空
     message: str | None = None             # action_type == FINISH / GIVE_UP 时的说明
+    tool_calls: list[ToolCall] | None = None # 多 tool call 时保存完整列表
 
     def to_dict(self) -> dict[str, Any]:
+        calls = self.iter_tool_calls()
         d = {
             "action_type": self.action_type.value,
             "thought": self.thought,
             "message": self.message,
             "tool_call": self.tool_call.to_dict() if self.tool_call else None,
+            "tool_calls": [tc.to_dict() for tc in calls] if calls else None,
         }
         return d
+
+    def iter_tool_calls(self) -> list[ToolCall]:
+        """返回本 action 要执行的全部工具调用，兼容旧的单 tool_call 字段。"""
+        if self.tool_calls:
+            return list(self.tool_calls)
+        if self.tool_call:
+            return [self.tool_call]
+        return []
 
     def is_terminal(self) -> bool:
         """是否是终止 action（不再需要执行工具）。"""

@@ -34,10 +34,10 @@ _ROOT = Path(__file__).parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from config.schema import load_config, merge_cli_overrides   # noqa: E402
-from llm.router import create_backend_from_config            # noqa: E402
-
 # 模块级 import（供 patch 使用）
+from agent.eval_dataset import (  # noqa: E402
+    DEFAULT_DATASET_NAME as DEFAULT_EVAL_DATASET,
+)
 from config.schema import load_config, merge_cli_overrides  # noqa: E402
 from llm.router import create_backend_from_config           # noqa: E402
 
@@ -120,12 +120,19 @@ def _print_step(event) -> None:
         thought = action.get("thought", "")[:160]
         atype = action.get("action_type", "")
         tc = action.get("tool_call")
+        tool_calls = action.get("tool_calls") or ([tc] if tc else [])
+        if atype == "give_up":
+            return
         click.echo(cyan(f"[Step {step}] {atype}"))
         if thought:
             click.echo(dim(f"  ↳ {thought}"))
-        if tc:
-            params_str = str(tc["params"])[:100]
-            click.echo(f"  Tool: {tc['name']}  params: {params_str}")
+        if tool_calls:
+            for idx, tool_call in enumerate(tool_calls, start=1):
+                label = f"{step}.{idx}" if len(tool_calls) > 1 else str(step)
+                params_str = str(tool_call["params"])[:100]
+                click.echo(
+                    f"  Tool[{label}]: {tool_call['name']}  params: {params_str}"
+                )
 
     elif etype == EventType.OBSERVATION:
         obs = payload["observation"]
@@ -166,6 +173,7 @@ def _print_step(event) -> None:
 @click.pass_context
 def cli(ctx: click.Context, config: str | None) -> None:
     """Coding Agent — autonomous code editing and bug fixing."""
+    # ctx 是 Click 的核心机制，用于在命令组及其子命令之间共享数据
     ctx.ensure_object(dict)
     ctx.obj["config_path"] = config
 
@@ -261,8 +269,9 @@ def run(
     )
 
     from agent.core import Agent, AgentConfig
-    from agent.event_log import EventLog, summarize_run
+    from agent.event_log import EventLog
     from agent.task import Task
+    from agent.telemetry import build_tracer_from_config
     try:
         from context.token_budget import is_tiktoken_available
     except ImportError:
@@ -280,6 +289,17 @@ def run(
         sys.stdout.write(dim(text))
         sys.stdout.flush()
 
+    try:
+        tracer = build_tracer_from_config(
+            config,
+            mode="run",
+            provider=config.llm.provider,
+            model=config.llm.model,
+        )
+    except ValueError as e:
+        click.echo(red(f"Error: {e}"), err=True)
+        sys.exit(1)
+
     agent_config = AgentConfig(
         max_steps=config.agent.max_steps,
         budget_tokens=config.agent.budget_tokens,
@@ -289,6 +309,7 @@ def run(
         thought_callback=_thought_cb if stream else None,
         confirm_dangerous=confirm,
         confirm_callback=confirm_cb,
+        tracer=tracer,
     )
     agent = Agent(backend, registry, agent_config)
 
@@ -306,12 +327,16 @@ def run(
 
     # 运行
     t0 = time.time()
-    with EventLog.create(task_obj, log_dir=config.agent.log_dir) as log:
-        click.echo(dim(f"  Log: {log.path}\n"))
-        result = agent.run(task_obj, log)
-        # 打印所有 events
-        for event in log.replay():
-            _print_step(event)
+    try:
+        with EventLog.create(task_obj, log_dir=config.agent.log_dir) as log:
+            click.echo(dim(f"  Log: {log.path}\n"))
+            result = agent.run(task_obj, log)
+            # 打印所有 events
+            for event in log.replay():
+                _print_step(event)
+    finally:
+        if getattr(tracer, "flush_on_exit", False):
+            tracer.flush()
 
     elapsed = time.time() - t0
 
@@ -393,14 +418,18 @@ def chat(
         runtime=runtime,
         repo_path=str(repo_path),
     )
-    session = ChatSession(
-        backend=backend,
-        registry=registry,
-        config=config,
-        repo_path=str(repo_path),
-        log_dir=config.agent.log_dir,
-        confirm_callback=confirm_cb,   # chat 模式默认开启确认
-    )
+    try:
+        session = ChatSession(
+            backend=backend,
+            registry=registry,
+            config=config,
+            repo_path=str(repo_path),
+            log_dir=config.agent.log_dir,
+            confirm_callback=confirm_cb,   # chat 模式默认开启确认
+        )
+    except ValueError as e:
+        click.echo(red(f"Error: {e}"), err=True)
+        sys.exit(1)
 
     # 欢迎信息
     click.echo(bold(f"\n🤖 Coding Agent — Chat Mode"))
@@ -488,8 +517,99 @@ def chat(
                 import traceback
                 traceback.print_exc()
 
+    session.close() # 显示将trace刷入langfuse中
+
     session.print_stats()
     click.echo(dim("  Bye!\n"))
+
+
+# ---------------------------------------------------------------------------
+# eval 子命令组
+# ---------------------------------------------------------------------------
+
+@cli.group("eval")
+def eval_cmd() -> None:
+    """Manage evaluation datasets."""
+
+
+@eval_cmd.command("add-trace")
+@click.argument("trace_ref")
+@click.option(
+    "--dataset", "-d",
+    "dataset_name",
+    default=DEFAULT_EVAL_DATASET,
+    show_default=True,
+    help="Langfuse dataset name.",
+)
+@click.option(
+    "--source-observation-id",
+    default=None,
+    help="Observation to link as the dataset source; defaults to URL peek/root.",
+)
+@click.option(
+    "--focused-observation-id",
+    default=None,
+    help="Observation that triggered the case; defaults to URL observation.",
+)
+@click.option(
+    "--failure-type",
+    default=None,
+    help="Failure label to store on the dataset item.",
+)
+@click.option(
+    "--notes",
+    default=None,
+    help="Human notes to store with the dataset item.",
+)
+@click.option(
+    "--no-create-dataset",
+    is_flag=True,
+    default=False,
+    help="Do not create the dataset if it does not exist.",
+)
+@click.pass_context
+def eval_add_trace(
+    ctx: click.Context,
+    trace_ref: str,
+    dataset_name: str,
+    source_observation_id: str | None,
+    focused_observation_id: str | None,
+    failure_type: str | None,
+    notes: str | None,
+    no_create_dataset: bool,
+) -> None:
+    """Add a Langfuse trace URL or trace id to a regression dataset."""
+    from agent import eval_dataset as eval_dataset_mod
+
+    config = load_config(ctx.obj.get("config_path"))
+    try:
+        result = eval_dataset_mod.add_trace_to_dataset(
+            trace_ref,
+            dataset_name=dataset_name,
+            config=config,
+            source_observation_id=source_observation_id,
+            focused_observation_id=focused_observation_id,
+            failure_type=failure_type,
+            notes=notes,
+            create_dataset=not no_create_dataset,
+        )
+    except ValueError as exc:
+        click.echo(red(f"Error: {exc}"), err=True)
+        sys.exit(1)
+    except Exception as exc:
+        click.echo(red(f"Error: failed to add trace to dataset: {exc}"), err=True)
+        sys.exit(1)
+
+    click.echo(green("Added Langfuse trace to dataset."))
+    click.echo(f"  Dataset : {result.dataset_name}")
+    click.echo(f"  Item    : {result.dataset_item_id or '(unknown)'}")
+    click.echo(f"  Trace   : {result.trace_id}")
+    click.echo(f"  Source  : {result.source_observation_id or '-'}")
+    if result.focused_observation_id:
+        click.echo(f"  Focus   : {result.focused_observation_id}")
+    click.echo(f"  Failure : {result.failure_type}")
+    if result.created_dataset:
+        click.echo(dim("  Dataset was created."))
 
 
 # ---------------------------------------------------------------------------
@@ -529,8 +649,13 @@ def log_show(log_file: str) -> None:
         etype = event.event_type.value
         detail = ""
         if event.event_type.value == "action":
-            tc = event.payload.get("action", {}).get("tool_call")
-            detail = f"  tool={tc['name']}" if tc else ""
+            action = event.payload.get("action", {})
+            tool_calls = action.get("tool_calls") or []
+            if not tool_calls and action.get("tool_call"):
+                tool_calls = [action["tool_call"]]
+            if tool_calls:
+                names = ",".join(tc["name"] for tc in tool_calls)
+                detail = f"  tool={names}"
         elif event.event_type.value == "observation":
             obs = event.payload.get("observation", {})
             detail = f"  status={obs.get('status')}"

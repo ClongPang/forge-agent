@@ -40,7 +40,7 @@ source .venv/bin/activate        # macOS/Linux
 pip install -e ".[dev]"
 
 # 验证安装
-agent --help
+forgeagent --help
 ```
 
 **可选：安装更多语言的代码解析支持**（让 repo-map 对更多语言精确分析）
@@ -150,8 +150,8 @@ python smoke_test.py
 
 | 方式 | 命令 | 适合场景 |
 |------|------|---------|
-| **chat** | `agent chat` | 持续对话，边改边聊，最常用 |
-| **run** | `agent run --task "..."` | 一次性明确任务，批处理 |
+| **chat** | `forgeagent chat` | 持续对话，边改边聊，最常用 |
+| **run** | `forgeagent run --task "..."` | 一次性明确任务，批处理 |
 | **GitHub Issue** | `python -m entry.github_issue` | 自动修复 Issue 并提 PR |
 
 ---
@@ -163,14 +163,14 @@ python smoke_test.py
 ```bash
 # 在当前目录的项目上启动
 cd /path/to/your/project
-agent chat
+forgeagent chat
 
 # 指定项目目录
-agent chat --repo /path/to/project
+forgeagent chat --repo /path/to/project
 
 # 切换模型（不改配置文件）
-agent chat --model deepseek-v4-pro
-agent chat --model gpt-4o --provider openai
+forgeagent chat --model deepseek-v4-pro
+forgeagent chat --model gpt-4o --provider openai
 ```
 
 ### 交互界面
@@ -266,13 +266,13 @@ you > /stats
 
 ```bash
 # 最简单：在当前目录执行任务
-agent run --task "修复所有 failing 的测试"
+forgeagent run --task "修复所有 failing 的测试"
 
 # 指定 repo
-agent run --repo /path/to/project --task "重构 api.py，拆分成更小的函数"
+forgeagent run --repo /path/to/project --task "重构 api.py，拆分成更小的函数"
 
 # 任务描述写在文件里（推荐用于复杂任务）
-agent run --task-file task.txt
+forgeagent run --task-file task.txt
 ```
 
 ### 所有选项
@@ -294,19 +294,19 @@ agent run --task-file task.txt
 
 ```bash
 # 修复特定测试
-agent run --task "tests/test_api.py::test_auth 报错 KeyError，修复它"
+forgeagent run --task "tests/test_api.py::test_auth 报错 KeyError，修复它"
 
 # 添加功能
-agent run --task "在 src/api.py 里添加 /health 接口，返回 {status: ok, version: 1.0}"
+forgeagent run --task "在 src/api.py 里添加 /health 接口，返回 {status: ok, version: 1.0}"
 
 # 代码重构
-agent run --task "把 utils.py 里超过 50 行的函数拆分成更小的函数，保持测试通过"
+forgeagent run --task "把 utils.py 里超过 50 行的函数拆分成更小的函数，保持测试通过"
 
 # 安全执行（危险命令需确认）
-agent run --task "清理项目，删除所有 .pyc 文件和 __pycache__ 目录" --confirm
+forgeagent run --task "清理项目，删除所有 .pyc 文件和 __pycache__ 目录" --confirm
 
 # Docker 沙箱（命令在容器里执行，不影响宿主机环境）
-agent run --task "安装依赖并运行测试" --sandbox
+forgeagent run --task "安装依赖并运行测试" --sandbox
 ```
 
 ---
@@ -350,7 +350,7 @@ python -m entry.github_issue \
 
 1. 拉取 Issue #42 的标题和描述作为任务
 2. Clone repo 到 `/tmp/myrepo`（已存在则跳过）
-3. 创建新分支 `agent/fix-issue-42-xxxxxxxx`
+3. 创建新分支 `forgeagent/fix-issue-42-xxxxxxxx`
 4. 在新分支上运行 agent 完成任务
 5. Push 分支到远端
 6. 自动创建 PR，标题和描述自动生成
@@ -364,8 +364,8 @@ python -m entry.github_issue \
 ### 列出日志文件
 
 ```bash
-agent log list
-agent log list --dir ./logs    # 指定日志目录
+forgeagent log list
+forgeagent log list --dir ./logs    # 指定日志目录
 ```
 
 输出示例：
@@ -380,7 +380,7 @@ Log files in ./logs:
 ### 查看单次运行详情
 
 ```bash
-agent log show logs/abc12345_20250525_143022.jsonl
+forgeagent log show logs/abc12345_20250525_143022.jsonl
 ```
 
 输出示例：
@@ -410,6 +410,27 @@ cat logs/abc12345_*.jsonl | jq 'select(.event_type=="action") | .payload.action.
 
 # 统计工具调用次数
 cat logs/abc12345_*.jsonl | jq 'select(.event_type=="action") | .payload.action.tool_call.name' | sort | uniq -c
+```
+
+### 将 Langfuse trace 加入回归数据集
+
+启用 Langfuse 观测后，可以把一次 trace URL 或 trace id 沉淀为数据集样本：
+
+```bash
+forgeagent eval add-trace "https://cloud.langfuse.com/project/.../traces?traceId=..."
+```
+
+默认写入 `forge-agent/regression` 数据集；如果 URL 带有 `peek` 和 `observation`
+参数，命令会自动把 `peek` 作为 dataset source observation，把当前选中的
+`observation` 记录到 metadata 里，便于之后做回归测试和失败分析。
+
+常用选项：
+
+```bash
+forgeagent eval add-trace TRACE_OR_URL \
+  --dataset forge-agent/regression \
+  --failure-type premature_finish \
+  --notes "final answer contained unexecuted tool syntax"
 ```
 
 ---
@@ -488,10 +509,10 @@ docker info    # 应该能正常输出
 
 ```bash
 # run 模式开启沙箱
-agent run --task "安装依赖并运行所有测试" --sandbox
+forgeagent run --task "安装依赖并运行所有测试" --sandbox
 
 # chat 模式开启沙箱
-agent chat --sandbox
+forgeagent chat --sandbox
 ```
 
 首次使用会拉取 `python:3.11-slim` 镜像（约 150MB），之后复用。
@@ -514,10 +535,10 @@ agent chat --sandbox
 
 ```bash
 # ❌ 太模糊，agent 不知道从哪里下手
-agent run --task "fix bug"
+forgeagent run --task "fix bug"
 
 # ✅ 具体说明文件、现象、预期结果
-agent run --task "src/parser.py 的 parse() 函数在输入空字符串时抛 ValueError，
+forgeagent run --task "src/parser.py 的 parse() 函数在输入空字符串时抛 ValueError，
 应该返回 None。修复它并在 tests/test_parser.py 里补上这个 case 的测试。"
 ```
 
@@ -583,7 +604,7 @@ cat > task.txt << 'EOF'
    - tests/ 目录下的任何文件
 EOF
 
-agent run --task-file task.txt
+forgeagent run --task-file task.txt
 ```
 
 ---
@@ -595,7 +616,7 @@ agent run --task-file task.txt
 先跑 `python smoke_test.py` 检查 API 是否联通。如果网络正常但还是卡，
 可能是模型响应慢，加 `--verbose` 看详细日志：
 ```bash
-agent chat --verbose
+forgeagent chat --verbose
 ```
 
 **Q：agent 陷入循环，一直重复同样的操作**
@@ -621,7 +642,7 @@ git checkout -- src/foo.py # 撤销特定文件
 几个节省 token 的方法：
 ```bash
 # 用 flash 版本替代 pro 版本
-agent chat --model deepseek-v4-flash
+forgeagent chat --model deepseek-v4-flash
 
 # 缩小 repo-map 预算（减少上下文注入量）
 # 编辑 config/default.yaml：
@@ -637,7 +658,7 @@ context:
 
 在任务描述里告诉 agent 先安装：
 ```bash
-agent run --task "先运行 pip install -r requirements.txt，然后运行所有测试" --sandbox
+forgeagent run --task "先运行 pip install -r requirements.txt，然后运行所有测试" --sandbox
 ```
 或者用 setup_cmds 在容器启动时预装（需要在代码里配置）。
 
@@ -686,10 +707,10 @@ context:
 
 ```bash
 # 日常开发用 flash（快且省钱）
-agent chat -c config/dev.yaml
+forgeagent chat -c config/dev.yaml
 
 # 复杂任务用 pro
-agent run --task "..." -c config/pro.yaml
+forgeagent run --task "..." -c config/pro.yaml
 ```
 
 `config/dev.yaml` 示例：
@@ -726,24 +747,24 @@ python smoke_test.py
 
 # 日常使用
 cd your-project
-agent chat                          # 开启对话
-agent chat --model deepseek-v4-pro  # 切换模型
+forgeagent chat                          # 开启对话
+forgeagent chat --model deepseek-v4-pro  # 切换模型
 
 # 一次性任务
-agent run --task "fix the failing tests"
-agent run --task-file task.txt
+forgeagent run --task "fix the failing tests"
+forgeagent run --task-file task.txt
 
 # 安全选项
-agent run --task "..." --confirm    # 危险命令需确认
-agent run --task "..." --sandbox    # Docker 沙箱
+forgeagent run --task "..." --confirm    # 危险命令需确认
+forgeagent run --task "..." --sandbox    # Docker 沙箱
 
 # GitHub Issue
 export GITHUB_TOKEN=ghp_xxx
 python -m entry.github_issue -r owner/repo -i 42 -l /tmp/repo
 
 # 查看日志
-agent log list
-agent log show logs/xxx.jsonl
+forgeagent log list
+forgeagent log show logs/xxx.jsonl
 
 # 对话内命令
 # /exit   退出

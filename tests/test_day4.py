@@ -79,6 +79,13 @@ class TestBuildSystemPrompt:
         prompt = build_system_prompt(".", [])
         assert "Repository summary not yet available" in prompt
 
+    def test_tool_strategy_guidance(self):
+        prompt = build_system_prompt(".", [make_tool_schema("file_read")])
+        assert "Use file_read only for specific files" in prompt
+        assert "find_files" in prompt
+        assert "Action:" in prompt
+        assert "Params:" in prompt
+
 
 class TestBuildTaskPrompt:
     def test_contains_description(self):
@@ -92,6 +99,13 @@ class TestBuildTaskPrompt:
     def test_with_issue_url(self):
         prompt = build_task_prompt("Fix X", "/repo", issue_url="https://github.com/org/repo/issues/42")
         assert "https://github.com/org/repo/issues/42" in prompt
+
+    def test_task_prompt_supports_analysis_without_forcing_edits(self):
+        prompt = build_task_prompt("Review the architecture", "/repo")
+        assert "Please work on the following task" in prompt
+        assert "analysis or review" in prompt
+        assert "without editing files" in prompt
+        assert "Please fix the following issue" not in prompt
 
     def test_without_issue_url(self):
         prompt = build_task_prompt("Fix X", "/repo")
@@ -295,22 +309,29 @@ class TestAnthropicBackend:
 
 class TestOpenAICompatBackend:
 
-    def _make_response(self, finish_reason, content=None, tool_calls=None):
+    def _make_response(
+        self,
+        finish_reason,
+        content=None,
+        tool_calls=None,
+        reasoning_content=None,
+    ):
         usage = SimpleNamespace(prompt_tokens=80, completion_tokens=40)
         message = SimpleNamespace(
             content=content,
             tool_calls=tool_calls,
+            reasoning_content=reasoning_content,
         )
         choice = SimpleNamespace(finish_reason=finish_reason, message=message)
         return SimpleNamespace(choices=[choice], usage=usage)
 
-    def _make_tool_call(self, name, args_dict):
+    def _make_tool_call(self, name, args_dict, tool_call_id="call_test"):
         fn = SimpleNamespace(name=name, arguments=json.dumps(args_dict))
-        return SimpleNamespace(function=fn)
+        return SimpleNamespace(id=tool_call_id, type="function", function=fn)
 
-    def _make_tool_call_raw(self, name, arguments):
+    def _make_tool_call_raw(self, name, arguments, tool_call_id="call_test"):
         fn = SimpleNamespace(name=name, arguments=arguments)
-        return SimpleNamespace(function=fn)
+        return SimpleNamespace(id=tool_call_id, type="function", function=fn)
 
     def _make_backend(self, model="gpt-4o"):
         with patch("openai.OpenAI"):
@@ -331,8 +352,18 @@ class TestOpenAICompatBackend:
         assert result.action.action_type == ActionType.TOOL_CALL
         assert result.action.tool_call.name == "shell"
         assert result.action.tool_call.params == {"cmd": "pytest"}
+        assert result.action.tool_call.id == "call_test"
+        assert result.assistant_message is not None
+        assert result.assistant_message.tool_calls == [{
+            "id": "call_test",
+            "type": "function",
+            "function": {
+                "name": "shell",
+                "arguments": '{"cmd": "pytest"}',
+            },
+        }]
 
-    def test_invalid_tool_arguments_become_raw_params(self):
+    def test_invalid_tool_arguments_give_up(self):
         backend = self._make_backend()
         response = self._make_response(
             "tool_calls",
@@ -342,9 +373,8 @@ class TestOpenAICompatBackend:
         backend._client.chat.completions.create.return_value = response
 
         result = backend.complete(make_messages("user", "fix it"), [make_tool_schema()])
-        assert result.action.action_type == ActionType.TOOL_CALL
-        assert result.action.tool_call.name == "shell"
-        assert result.action.tool_call.params == {"raw": "{bad json"}
+        assert result.action.action_type == ActionType.GIVE_UP
+        assert "Invalid tool arguments JSON" in result.action.message
 
     def test_stop_response_is_finish(self):
         backend = self._make_backend()
@@ -353,6 +383,62 @@ class TestOpenAICompatBackend:
 
         result = backend.complete(make_messages("user", "fix it"), [])
         assert result.action.action_type == ActionType.FINISH
+        assert result.action.message == "Task is done."
+        assert result.action.thought == ""
+
+    def test_reasoning_content_preserved_for_finish(self):
+        backend = self._make_backend()
+        response = self._make_response(
+            "stop",
+            content="Task is done.",
+            reasoning_content="I checked the relevant files.",
+        )
+        backend._client.chat.completions.create.return_value = response
+
+        result = backend.complete(make_messages("user", "fix it"), [])
+        assert result.action.action_type == ActionType.FINISH
+        assert result.action.message == "Task is done."
+        assert result.action.thought == "I checked the relevant files."
+        assert result.assistant_message is not None
+        assert result.assistant_message.reasoning_content == "I checked the relevant files."
+
+    def test_reasoning_content_preserved_for_tool_call(self):
+        backend = self._make_backend()
+        response = self._make_response(
+            "tool_calls",
+            tool_calls=[self._make_tool_call("shell", {"cmd": "pytest"})],
+            reasoning_content="I should run the tests first.",
+        )
+        backend._client.chat.completions.create.return_value = response
+
+        result = backend.complete(make_messages("user", "fix it"), [make_tool_schema()])
+        assert result.action.action_type == ActionType.TOOL_CALL
+        assert result.action.tool_call.name == "shell"
+        assert result.action.thought == "I should run the tests first."
+        assert result.assistant_message is not None
+        assert result.assistant_message.reasoning_content == "I should run the tests first."
+
+    def test_multiple_tool_calls_parsed(self):
+        backend = self._make_backend()
+        response = self._make_response(
+            "tool_calls",
+            tool_calls=[
+                self._make_tool_call("shell", {"cmd": "pytest"}, tool_call_id="call_1"),
+                self._make_tool_call("shell", {"cmd": "ruff check ."}, tool_call_id="call_2"),
+            ],
+        )
+        backend._client.chat.completions.create.return_value = response
+
+        result = backend.complete(make_messages("user", "fix it"), [make_tool_schema()])
+        assert result.action.action_type == ActionType.TOOL_CALL
+        calls = result.action.iter_tool_calls()
+        assert len(calls) == 2
+        assert result.action.tool_call.id == "call_1"
+        assert calls[0].params == {"cmd": "pytest"}
+        assert calls[1].id == "call_2"
+        assert calls[1].params == {"cmd": "ruff check ."}
+        assert result.assistant_message is not None
+        assert len(result.assistant_message.tool_calls) == 2
 
     def test_length_finish_reason_is_give_up(self):
         backend = self._make_backend()
@@ -383,89 +469,24 @@ class TestOpenAICompatBackend:
         assert result.input_tokens == 80
         assert result.output_tokens == 40
 
+    def test_deepseek_v4_request_enables_thinking(self):
+        backend = self._make_backend(model="deepseek-v4-pro")
+        response = self._make_response("stop", content="done")
+        backend._client.chat.completions.create.return_value = response
 
-# ===========================================================================
-# OpenAICompatBackend — 文本解析 fallback（R1 模型）
-# ===========================================================================
+        backend.complete(make_messages("user", "go"), [make_tool_schema("shell")])
 
-class TestTextFallback:
-
-    def _make_backend(self):
-        with patch("openai.OpenAI"):
-            from llm.openai_compat import OpenAICompatBackend
-            # deepseek-reasoner 不支持 function calling
-            backend = OpenAICompatBackend(model="deepseek-reasoner", api_key="sk-test")
-            return backend
-
-    def _make_response(self, text):
-        usage = SimpleNamespace(prompt_tokens=50, completion_tokens=30)
-        message = SimpleNamespace(content=text, tool_calls=None)
-        choice = SimpleNamespace(finish_reason="stop", message=message)
-        return SimpleNamespace(choices=[choice], usage=usage)
-
-    def test_r1_model_no_function_calling(self):
-        from llm.openai_compat import OpenAICompatBackend
-        with patch("openai.OpenAI"):
-            backend = OpenAICompatBackend(model="deepseek-reasoner", api_key="sk-test")
-        assert not backend.supports_function_calling
-
-    def test_json_block_parsed_as_tool_call(self):
-        backend = self._make_backend()
-        text = '```json\n{"tool": "shell", "params": {"cmd": "pytest"}}\n```'
-        backend._client.chat.completions.create.return_value = self._make_response(text)
-
-        result = backend.complete(make_messages("user", "fix it"), [make_tool_schema()])
-        assert result.action.action_type == ActionType.TOOL_CALL
-        assert result.action.tool_call.name == "shell"
-
-    def test_non_object_text_params_fall_back_to_empty_params(self):
-        backend = self._make_backend()
-        text = '```json\n{"tool": "shell", "params": "pytest"}\n```'
-        backend._client.chat.completions.create.return_value = self._make_response(text)
-
-        result = backend.complete(make_messages("user", "fix it"), [make_tool_schema()])
-        assert result.action.action_type == ActionType.TOOL_CALL
-        assert result.action.tool_call.name == "shell"
-        assert result.action.tool_call.params == {}
-
-    def test_task_complete_keyword(self):
-        backend = self._make_backend()
-        backend._client.chat.completions.create.return_value = self._make_response(
-            "TASK_COMPLETE: Fixed the parser bug by correcting the regex."
-        )
-        result = backend.complete(make_messages("user", "fix it"), [])
-        assert result.action.action_type == ActionType.FINISH
-        assert "Fixed the parser" in result.action.message
-
-    def test_give_up_keyword(self):
-        backend = self._make_backend()
-        backend._client.chat.completions.create.return_value = self._make_response(
-            "GIVE_UP: The issue requires access to external systems."
-        )
-        result = backend.complete(make_messages("user", "fix it"), [])
-        assert result.action.action_type == ActionType.GIVE_UP
-
-    def test_unparseable_text_is_give_up(self):
-        backend = self._make_backend()
-        backend._client.chat.completions.create.return_value = self._make_response(
-            "I am thinking about the problem... hmm..."
-        )
-        result = backend.complete(make_messages("user", "fix it"), [])
-        assert result.action.action_type == ActionType.GIVE_UP
-
-    def test_tool_description_injected_in_system(self):
-        """R1 模式下，工具描述应注入 system prompt 而非 tools 参数。"""
-        backend = self._make_backend()
-        backend._client.chat.completions.create.return_value = self._make_response(
-            "TASK_COMPLETE: done"
-        )
-        backend.complete(
-            make_messages("system", "you are an agent", "user", "fix it"),
-            [make_tool_schema("shell")],
-        )
         call_kwargs = backend._client.chat.completions.create.call_args[1]
-        # tools 参数不应该存在
-        assert "tools" not in call_kwargs
-        # system 消息内容应包含工具描述
-        system_content = call_kwargs["messages"][0]["content"]
-        assert "shell" in system_content
+        assert call_kwargs["reasoning_effort"] == "high"
+        assert call_kwargs["extra_body"] == {"thinking": {"type": "enabled"}}
+
+    def test_non_deepseek_request_does_not_send_thinking_params(self):
+        backend = self._make_backend(model="gpt-4o")
+        response = self._make_response("stop", content="done")
+        backend._client.chat.completions.create.return_value = response
+
+        backend.complete(make_messages("user", "go"), [make_tool_schema("shell")])
+
+        call_kwargs = backend._client.chat.completions.create.call_args[1]
+        assert "reasoning_effort" not in call_kwargs
+        assert "extra_body" not in call_kwargs

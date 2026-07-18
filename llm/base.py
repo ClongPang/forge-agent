@@ -26,12 +26,15 @@ from agent.task import Action, ActionType, ToolCall
 class LLMMessage:
     """
     发送给 LLM 的单条消息。
-    role: "system" | "user" | "assistant"
-    content 是纯文本；tool_call_id 仅在 role=="tool" 时使用（OpenAI 格式）。
+    role: "system" | "user" | "assistant" | "tool"
+    content 是纯文本；tool_call_id 仅在 role=="tool" 时使用。
+    reasoning_content/tool_calls 用于 OpenAI-compatible 原生 assistant 消息回传。
     """
     role: str
     content: str
     tool_call_id: str | None = None     # OpenAI function calling 回传结果时需要
+    reasoning_content: str | None = None
+    tool_calls: list[dict[str, Any]] | None = None
 
 
 @dataclass
@@ -55,6 +58,7 @@ class LLMResponse:
     raw_content: str                    # LLM 原始文本输出，调试用
     input_tokens: int = 0
     output_tokens: int = 0
+    assistant_message: LLMMessage | None = None
 
     @property
     def total_tokens(self) -> int:
@@ -103,8 +107,7 @@ class LLMBackend(ABC):
     def supports_function_calling(self) -> bool:
         """
         是否支持 function calling。
-        默认 True；不支持的模型（如 DeepSeek R1）覆盖返回 False，
-        core.py 会切换到文本解析路径（暂未实现，v2 补充）。
+        默认 True；后端可以在确有需要时覆盖此能力标记。
         """
         return True
 

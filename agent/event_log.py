@@ -201,16 +201,27 @@ class EventLog:
                 continue
             raw_action = event.payload["action"]
             raw_tc = raw_action.get("tool_call")
+            raw_tcs = raw_action.get("tool_calls") or []
             tool_call = None
             if raw_tc:
                 tool_call = ToolCall(
                     name=raw_tc["name"],
                     params=raw_tc["params"],
+                    id=raw_tc.get("id"),
                 )
+            tool_calls = [
+                ToolCall(
+                    name=item["name"],
+                    params=item["params"],
+                    id=item.get("id"),
+                )
+                for item in raw_tcs
+            ] or ([tool_call] if tool_call else None)
             actions.append(Action(
                 action_type=ActionType(raw_action["action_type"]),
                 thought=raw_action["thought"],
                 tool_call=tool_call,
+                tool_calls=tool_calls,
                 message=raw_action.get("message"),
             ))
         return actions
@@ -281,8 +292,11 @@ def summarize_run(log: EventLog) -> dict:
     for event in events:
         if event.event_type == EventType.ACTION:
             stats["actions"] += 1
-            tc = event.payload["action"].get("tool_call")
-            if tc:
+            action = event.payload["action"]
+            tool_calls = action.get("tool_calls") or []
+            if not tool_calls and action.get("tool_call"):
+                tool_calls = [action["tool_call"]]
+            for tc in tool_calls:
                 name = tc["name"]
                 stats["tool_calls"][name] = stats["tool_calls"].get(name, 0) + 1
 

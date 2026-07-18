@@ -17,6 +17,7 @@ dependencies = [
     "tree-sitter-python>=0.22.0",
     "PyGithub>=2.3.0",
     "gitpython>=3.1.0",
+    "langfuse>=4,<5",
 ]
 
 [project.optional-dependencies]

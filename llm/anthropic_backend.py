@@ -215,6 +215,7 @@ def _anthropic_stream(
     messages: list,
     tools: list,
     on_text: StreamCallback | None = None,
+    on_thought: StreamCallback | None = None,
 ) -> LLMResponse:
     """
     Anthropic 流式调用实现。

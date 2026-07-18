@@ -7,17 +7,18 @@ Day 7 测试：重试逻辑、git diff patch、repo_map 缓存隔离、集成跑
 from __future__ import annotations
 
 import subprocess
-import time
+import tomllib
 from pathlib import Path
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from agent.core import Agent, AgentConfig
 from agent.event_log import EventLog
-from agent.task import Action, ActionType, RunStatus, Task, ToolCall
-from llm.base import LLMMessage, LLMResponse, LLMToolSchema, MockBackend
+from agent.task import Action, ActionType, Task, ToolCall
+from llm.base import LLMMessage, MockBackend
 from tools.base import NoopTool, ToolRegistry
+from tools.file_tool import FileWriteTool
 
 
 # ---------------------------------------------------------------------------
@@ -196,9 +197,8 @@ class TestGetGitDiff:
         diff = agent._get_git_diff(str(tmp_path))
         assert diff is None   # 不是 git repo，不崩溃
 
-    def test_patch_included_in_run_result(self, git_repo):
-        """agent FINISH 后 RunResult.patch 应包含 diff。"""
-        # 先修改文件（模拟 agent 的 file_write 操作）
+    def test_existing_dirty_diff_is_not_counted_as_run_patch(self, git_repo):
+        """运行前已存在的 dirty diff 不应让本轮 has_patch 为 true。"""
         (git_repo / "main.py").write_text("x = 99\n")
 
         task = Task(
@@ -209,6 +209,35 @@ class TestGetGitDiff:
         )
         registry = ToolRegistry().register(NoopTool("shell"))
         script = [Action(ActionType.FINISH, "done", message="Fixed it")]
+        backend = MockBackend(script)
+        agent = Agent(backend, registry)
+
+        with EventLog.create(task, log_dir=str(git_repo / "logs")) as log:
+            result = agent.run(task, log)
+
+        assert result.is_success()
+        assert result.patch is None
+
+    def test_patch_included_when_run_changes_file(self, git_repo):
+        """本轮运行期间产生的新 diff 应包含在 RunResult.patch 中。"""
+        task = Task(
+            task_id="patchtest2",
+            description="fix",
+            repo_path=str(git_repo),
+            max_steps=5,
+        )
+        registry = ToolRegistry().register(FileWriteTool())
+        script = [
+            Action(
+                ActionType.TOOL_CALL,
+                "write file",
+                ToolCall(
+                    "file_write",
+                    {"path": str(git_repo / "main.py"), "content": "x = 99\n"},
+                ),
+            ),
+            Action(ActionType.FINISH, "done", message="Fixed it"),
+        ]
         backend = MockBackend(script)
         agent = Agent(backend, registry)
 
@@ -415,17 +444,22 @@ class TestIntegration:
 # ===========================================================================
 
 class TestPyprojectToml:
+    def _load_pyproject(self):
+        path = Path(__file__).parent.parent / "pyproject.toml"
+        with path.open("rb") as handle:
+            return tomllib.load(handle)
+
     def test_pyproject_has_entry_point(self):
-        content = (Path(__file__).parent.parent / "pyproject.toml").read_text()
-        assert "agent = " in content
-        assert "entry.cli:main" in content
+        data = self._load_pyproject()
+        assert data["project"]["scripts"]["forgeagent"] == "entry.cli:main"
 
     def test_pyproject_has_dev_extras(self):
-        content = (Path(__file__).parent.parent / "pyproject.toml").read_text()
-        assert "[project.optional-dependencies]" in content
-        assert "pytest" in content
+        data = self._load_pyproject()
+        dev_deps = data["project"]["optional-dependencies"]["dev"]
+        assert any(dep.startswith("pytest") for dep in dev_deps)
 
     def test_pyproject_has_full_extras(self):
-        content = (Path(__file__).parent.parent / "pyproject.toml").read_text()
-        assert "tiktoken" in content
-        assert "tree-sitter-javascript" in content
+        data = self._load_pyproject()
+        full_deps = data["project"]["optional-dependencies"]["full"]
+        assert any(dep.startswith("tiktoken") for dep in full_deps)
+        assert any(dep.startswith("tree-sitter-javascript") for dep in full_deps)

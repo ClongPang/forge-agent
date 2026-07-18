@@ -22,7 +22,7 @@ python smoke_test.py
 
 # 使用
 cd your-project
-agent chat
+forgeagent chat
 ```
 
 ---
@@ -34,10 +34,10 @@ agent chat
 持续对话，每轮历史保留，最接近 Claude Code 的体验：
 
 ```bash
-agent chat                            # 当前目录
-agent chat --repo /path/to/project   # 指定目录
-agent chat --model deepseek-v4-pro   # 切换模型
-agent chat --sandbox                  # Docker 沙箱
+forgeagent chat                            # 当前目录
+forgeagent chat --repo /path/to/project   # 指定目录
+forgeagent chat --model deepseek-v4-pro   # 切换模型
+forgeagent chat --sandbox                  # Docker 沙箱
 ```
 
 对话内命令：`/exit` 退出、`/stats` 查看统计、`/clear` 清空历史、`/help` 帮助
@@ -47,10 +47,10 @@ agent chat --sandbox                  # Docker 沙箱
 一次性任务，适合明确的批处理场景：
 
 ```bash
-agent run --task "修复所有 failing 的测试"
-agent run --task-file task.txt           # 从文件读任务
-agent run --task "..." --confirm         # 危险命令需确认
-agent run --task "..." --sandbox         # Docker 沙箱
+forgeagent run --task "修复所有 failing 的测试"
+forgeagent run --task-file task.txt           # 从文件读任务
+forgeagent run --task "..." --confirm         # 危险命令需确认
+forgeagent run --task "..." --sandbox         # Docker 沙箱
 ```
 
 ### GitHub Issue 自动修复
@@ -118,7 +118,7 @@ coding-agent/
 │   └── history.py      # 对话历史滑动窗口
 │
 ├── entry/              # 入口层
-│   ├── cli.py          # Click CLI（run / chat / log 子命令）
+│   ├── cli.py          # Click CLI（run / chat / log / eval 子命令）
 │   ├── chat.py         # ChatSession，跨轮持久化历史
 │   └── github_issue.py # GitHub Issue → PR 自动化
 │
@@ -126,7 +126,7 @@ coding-agent/
 │   ├── default.yaml    # 默认配置
 │   └── schema.py       # 配置加载与校验
 │
-├── tests/              # 376 个测试，覆盖所有模块
+├── tests/              # pytest 测试，覆盖核心模块
 ├── smoke_test.py       # 端到端联通验证
 ├── quicksort_task.py   # 示例任务脚本
 └── USAGE.md            # 完整使用教程
@@ -139,7 +139,8 @@ coding-agent/
 **多模型支持**
 - Anthropic Claude（原生 tool_use）
 - OpenAI、DeepSeek、Groq、Ollama（OpenAI-compatible）
-- DeepSeek R1 等不支持 function calling 的模型走文本解析 fallback
+- OpenAI-compatible 后端统一使用原生 tool/function calling
+- DeepSeek V4 模型自动启用 thinking/reasoning 参数
 - 配置文件一行切换，或 `--model` 参数临时覆盖
 
 **多语言 Repo-map**
@@ -211,15 +212,18 @@ pip install tiktoken
 
 ```bash
 # chat
-agent chat [--repo PATH] [--model MODEL] [--sandbox] [-v]
+forgeagent chat [--repo PATH] [--model MODEL] [--sandbox] [-v]
 
 # run
-agent run --task TEXT [--repo PATH] [--task-file FILE]
+forgeagent run --task TEXT [--repo PATH] [--task-file FILE]
           [--model MODEL] [--confirm] [--sandbox] [--no-stream] [-v]
 
 # log
-agent log list [--dir DIR]
-agent log show LOG_FILE
+forgeagent log list [--dir DIR]
+forgeagent log show LOG_FILE
+
+# eval
+forgeagent eval add-trace TRACE_OR_URL [--dataset DATASET]
 
 # github issue
 python -m entry.github_issue \

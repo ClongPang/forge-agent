@@ -108,15 +108,15 @@ def create_backend_from_config(config: dict) -> LLMBackend:
     从配置字典创建 backend，对应 config/default.yaml 的 llm 节。
 
     config 格式：
-        provider: anthropic
-        model: claude-sonnet-4-5
+        provider: deepseek
+        model: deepseek-v4-pro
         api_key: sk-...        # 可选，缺省读环境变量
         base_url:              # 可选
         max_tokens: 4096       # 可选
     """
     return create_backend(
-        provider=config.get("provider", "anthropic"),
-        model=config.get("model", "claude-sonnet-4-5"),
+        provider=config.get("provider", "deepseek"),
+        model=config.get("model", "deepseek-v4-pro"),
         api_key=config.get("api_key") or None,
         base_url=config.get("base_url") or None,
         max_tokens=int(config.get("max_tokens", 4096)),

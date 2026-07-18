@@ -9,6 +9,7 @@ tests/test_stream.py
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -227,29 +228,111 @@ class TestCliStreamOption:
 
 
 # ---------------------------------------------------------------------------
-# AnthropicBackend / OpenAICompatBackend stream() 方法存在性
+# OpenAICompatBackend stream parsing
 # ---------------------------------------------------------------------------
 
-class TestBackendStreamMethod:
-    def test_anthropic_backend_has_stream(self):
-        from llm.anthropic_backend import AnthropicBackend
-        assert hasattr(AnthropicBackend, "stream")
-        assert callable(AnthropicBackend.stream)
+class TestOpenAICompatStreamParsing:
+    def _make_backend(self):
+        with patch("openai.OpenAI"):
+            from llm.openai_compat import OpenAICompatBackend
+            return OpenAICompatBackend(model="deepseek-v4-pro", api_key="sk-test")
 
-    def test_openai_compat_backend_has_stream(self):
-        from llm.openai_compat import OpenAICompatBackend
-        assert hasattr(OpenAICompatBackend, "stream")
-        assert callable(OpenAICompatBackend.stream)
+    def _chunk(
+        self,
+        content=None,
+        reasoning_content=None,
+        tool_calls=None,
+        finish_reason=None,
+    ):
+        delta = SimpleNamespace(
+            content=content,
+            reasoning_content=reasoning_content,
+            tool_calls=tool_calls,
+        )
+        choice = SimpleNamespace(delta=delta, finish_reason=finish_reason)
+        return SimpleNamespace(choices=[choice])
 
-    def test_anthropic_stream_signature(self):
-        """stream() 方法接受 on_text 参数。"""
-        import inspect
-        from llm.anthropic_backend import AnthropicBackend
-        sig = inspect.signature(AnthropicBackend.stream)
-        assert "on_text" in sig.parameters
+    def test_stream_finish_preserves_reasoning_content(self):
+        backend = self._make_backend()
+        backend._client.chat.completions.create.return_value = [
+            self._chunk(reasoning_content="I checked the files. "),
+            self._chunk(content="Task is done."),
+            self._chunk(finish_reason="stop"),
+        ]
 
-    def test_openai_stream_signature(self):
-        import inspect
-        from llm.openai_compat import OpenAICompatBackend
-        sig = inspect.signature(OpenAICompatBackend.stream)
-        assert "on_text" in sig.parameters
+        result = backend.stream([LLMMessage(role="user", content="fix it")], [])
+
+        assert result.action.action_type == ActionType.FINISH
+        assert result.action.message == "Task is done."
+        assert result.action.thought == "I checked the files."
+        assert result.assistant_message is not None
+        assert result.assistant_message.reasoning_content == "I checked the files. "
+
+    def test_stream_tool_call_preserves_reasoning_content(self):
+        backend = self._make_backend()
+        fn = SimpleNamespace(name="shell", arguments='{"cmd": "pytest"}')
+        tool_delta = SimpleNamespace(
+            index=0,
+            id="call_stream",
+            type="function",
+            function=fn,
+        )
+        backend._client.chat.completions.create.return_value = [
+            self._chunk(reasoning_content="I should run tests first."),
+            self._chunk(tool_calls=[tool_delta], finish_reason="tool_calls"),
+        ]
+
+        result = backend.stream(
+            [LLMMessage(role="user", content="fix it")],
+            [LLMToolSchema("shell", "run command", {})],
+        )
+
+        assert result.action.action_type == ActionType.TOOL_CALL
+        assert result.action.tool_call.name == "shell"
+        assert result.action.tool_call.params == {"cmd": "pytest"}
+        assert result.action.tool_call.id == "call_stream"
+        assert result.action.thought == "I should run tests first."
+        assert result.assistant_message is not None
+        assert result.assistant_message.tool_calls == [{
+            "id": "call_stream",
+            "type": "function",
+            "function": {
+                "name": "shell",
+                "arguments": '{"cmd": "pytest"}',
+            },
+        }]
+        assert result.assistant_message.reasoning_content == "I should run tests first."
+
+    def test_stream_multiple_tool_calls_parsed(self):
+        backend = self._make_backend()
+        tool_delta_1 = SimpleNamespace(
+            index=0,
+            id="call_1",
+            type="function",
+            function=SimpleNamespace(name="shell", arguments='{"cmd": "pytest"}'),
+        )
+        tool_delta_2 = SimpleNamespace(
+            index=1,
+            id="call_2",
+            type="function",
+            function=SimpleNamespace(name="shell", arguments='{"cmd": "ruff check ."}'),
+        )
+        backend._client.chat.completions.create.return_value = [
+            self._chunk(reasoning_content="I should run checks."),
+            self._chunk(tool_calls=[tool_delta_1, tool_delta_2], finish_reason="tool_calls"),
+        ]
+
+        result = backend.stream(
+            [LLMMessage(role="user", content="fix it")],
+            [LLMToolSchema("shell", "run command", {})],
+        )
+
+        assert result.action.action_type == ActionType.TOOL_CALL
+        calls = result.action.iter_tool_calls()
+        assert len(calls) == 2
+        assert calls[0].id == "call_1"
+        assert calls[0].params == {"cmd": "pytest"}
+        assert calls[1].id == "call_2"
+        assert calls[1].params == {"cmd": "ruff check ."}
+        assert result.assistant_message is not None
+        assert len(result.assistant_message.tool_calls) == 2

@@ -270,9 +270,13 @@ class GitAddTool(BaseTool):
 
     def execute(self, params: dict[str, Any]) -> ToolResult:
         cwd = params.get("cwd")
-        paths: list[str] = params.get("paths", ["."])
+        paths: list[str] = params.get("paths", [])
         if not paths:
-            paths = ["."]
+            return ToolResult(
+                success=False,
+                output="",
+                error="git_add requires explicit paths; implicit git add . is rejected",
+            )
 
         for path in paths:
             path_error = _check_git_path(path, cwd, self._boundary, "git add path")

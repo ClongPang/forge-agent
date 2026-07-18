@@ -61,6 +61,7 @@ def _print_event_live(event) -> None:
         thought = (action.get("thought") or "").strip()
         atype = action.get("action_type", "")
         tc = action.get("tool_call")
+        tool_calls = action.get("tool_calls") or ([tc] if tc else [])
 
         # 流式模式：thought 已经被 stream_callback 实时打印出来了
         # 非流式模式或 thought 为空时，在这里补打
@@ -71,32 +72,36 @@ def _print_event_live(event) -> None:
             sys.stdout.write("\n")   # 确保工具调用从新行开始
             sys.stdout.flush()
 
-        if tc:
-            _print_event_live._last_tool_name = tc['name']  # 供 observation 判断
-            click.echo(cyan(f"  [{step}] {tc['name']}"), nl=False)
+        if tool_calls:
+            _print_event_live._pending_tool_names = [
+                item.get("name", "") for item in tool_calls
+            ]
+            _print_event_live._multi_tool_step = len(tool_calls) > 1
             # 打印关键参数
-            params = tc.get("params", {})
-            key_param = (
-                params.get("cmd")
-                or params.get("path")
-                or params.get("pattern")
-                or params.get("symbol")
-                or params.get("message")
-                or ""
-            )
-            if key_param:
-                short_param = str(key_param)[:60]
-                suffix = "..." if len(str(key_param)) > 60 else ""
-                click.echo(cyan(f"  {short_param}{suffix}"))
-            else:
-                click.echo()
+            for idx, tool_call in enumerate(tool_calls, start=1):
+                tool_name = tool_call.get("name", "")
+                label = f"{step}.{idx}" if len(tool_calls) > 1 else str(step)
+                click.echo(cyan(f"  [{label}] {tool_name}"), nl=False)
+                params = tool_call.get("params", {})
+                key_param = (
+                    params.get("cmd")
+                    or params.get("path")
+                    or params.get("pattern")
+                    or params.get("symbol")
+                    or params.get("message")
+                    or ""
+                )
+                if key_param:
+                    short_param = str(key_param)[:60]
+                    suffix = "..." if len(str(key_param)) > 60 else ""
+                    click.echo(cyan(f"  {short_param}{suffix}"))
+                else:
+                    click.echo()
         elif atype == "finish":
             click.echo(green(f"\n  [{step}] ✓ finish"))
             # 把 message 存到全局，供 TASK_COMPLETE event 打印
             _finish_message = action.get("message", "") or ""
             _print_event_live._pending_message = _finish_message
-        elif atype == "give_up":
-            click.echo(red(f"\n  [{step}] ✗ give_up"))
 
     elif etype == EventType.OBSERVATION:
         obs = p["observation"]
@@ -104,28 +109,37 @@ def _print_event_live(event) -> None:
         output = (obs.get("output") or "").strip()
         error = obs.get("error")
 
-        # 从上一条 action event 取工具名（_last_tool_name 由 ACTION 分支设置）
-        tool_name = getattr(_print_event_live, "_last_tool_name", "")
+        # 从上一条 action event 的队列取工具名，支持同一 step 多个 tool call。
+        pending = getattr(_print_event_live, "_pending_tool_names", [])
+        if pending:
+            tool_name = pending.pop(0)
+            _print_event_live._pending_tool_names = pending
+        else:
+            tool_name = obs.get("tool_name", "")
+        multi_tool_step = bool(getattr(_print_event_live, "_multi_tool_step", False))
+        if not pending:
+            _print_event_live._multi_tool_step = False
 
         # 只读类工具：只显示 ✓ 或 ✗，不打印内容（内容已被模型读取，用户不需要看）
         SILENT_TOOLS = {"file_read", "file_view", "file_write", "find_files", "find_symbol"}
         silent = tool_name in SILENT_TOOLS
+        label = f" [{tool_name}]" if multi_tool_step and tool_name else ""
 
         if status == "success":
             if silent:
-                click.echo(green("  ✓"))
+                click.echo(green(f"  ✓{label}"))
             else:
                 lines = output.splitlines()
                 MAX_PREVIEW = 20
                 preview = "\n".join(f"    {l}" for l in lines[:MAX_PREVIEW])
                 if lines:
-                    click.echo(green("  ✓") + dim(f"\n{preview}"))
+                    click.echo(green(f"  ✓{label}") + dim(f"\n{preview}"))
                     if len(lines) > MAX_PREVIEW:
                         click.echo(dim(f"    ... ({len(lines)-MAX_PREVIEW} more lines)"))
                 else:
-                    click.echo(green("  ✓"))
+                    click.echo(green(f"  ✓{label}"))
         else:
-            click.echo(red(f"  ✗ {error or output[:120]}"))
+            click.echo(red(f"  ✗{label} {error or output[:120]}"))
 
     elif etype == EventType.REFLECTION:
         reason = p.get("reason", "")
@@ -169,6 +183,7 @@ class ChatSession:
 
     def __init__(self, backend, registry, config, repo_path: str, log_dir: str, confirm_callback=None) -> None:
         from agent.core import Agent, AgentConfig
+        from agent.telemetry import build_tracer_from_config
         from context.history import ConversationHistory
 
         self.repo_path = repo_path
@@ -210,6 +225,13 @@ class ChatSession:
             _streamed_buf.append(text)
             _print_event_live._streamed_thought = "".join(_streamed_buf)
 
+        self.tracer = build_tracer_from_config(
+            config,
+            mode="chat",
+            provider=config.llm.provider,
+            model=config.llm.model,
+        )
+
         agent_cfg = AgentConfig(
             max_steps=config.agent.max_steps,
             budget_tokens=config.agent.budget_tokens,
@@ -221,6 +243,7 @@ class ChatSession:
             thought_callback=_thought_cb,
             confirm_dangerous=confirm_callback is not None,
             confirm_callback=confirm_callback,
+            tracer=self.tracer,
         )
         self.agent = Agent(backend, registry, agent_cfg)
         self._shared_history = ConversationHistory(
@@ -242,7 +265,6 @@ class ChatSession:
         Returns:
             True 表示成功/正常结束，False 表示失败
         """
-        from agent.core import AgentConfig
         from agent.event_log import EventLog
         from agent.task import Task
         from llm.base import LLMMessage
@@ -295,7 +317,7 @@ class ChatSession:
             f"{elapsed:.1f}s ───"
         ))
 
-        return result.is_success() or result.status.value == "gave_up"
+        return result.is_success() or result.status.value == "gave_up" # llm输出被判断为gave_up时同样终止本轮
 
     def _run_with_live_print(self, task, log):
         """
@@ -325,10 +347,6 @@ class ChatSession:
         ConversationHistory 之后、第一次调用 LLM 之前，
         把我们的共享 history 替换进去。
         """
-        from context.history import ConversationHistory
-        from agent.prompt import build_task_prompt
-        from llm.base import LLMMessage
-
         agent = self.agent
 
         # 直接调用 agent.run()，但在它内部：
@@ -356,3 +374,8 @@ class ChatSession:
         click.echo(f"    Steps   : {self.total_steps}")
         click.echo(f"    Tokens  : {self.total_tokens:,}")
         click.echo(bold(f"{'─'*50}\n"))
+
+    def close(self) -> None:
+        """Flush remote telemetry before chat exits."""
+        if getattr(self.tracer, "flush_on_exit", False):
+            self.tracer.flush()

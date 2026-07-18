@@ -13,9 +13,9 @@ import pytest
 from context.history import ConversationHistory
 from context.repo_map import RepoMap, _extract_python_symbols, _extract_symbols_regex
 from context.token_budget import TokenBudget, estimate_tokens
-from llm.base import LLMMessage, MockBackend
+from llm.base import LLMBackend, LLMMessage, LLMResponse, MockBackend
 from agent.task import Action, ActionType, Task, ToolCall
-from tools.base import NoopTool, ToolRegistry
+from tools.base import FailingTool, NoopTool, ToolRegistry
 
 
 # ---------------------------------------------------------------------------
@@ -254,6 +254,30 @@ class TestTokenBudget:
         assert "total" in report
         assert report["budget"] == 10_000
 
+    def test_trim_history_preserves_protocol_metadata(self):
+        budget = TokenBudget(total=10_000)
+        tool_calls = [{
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "shell", "arguments": '{"cmd": "ls"}'},
+        }]
+        msgs = [
+            {"role": "user", "content": "task"},
+            {
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": "I should inspect files.",
+                "tool_calls": tool_calls,
+            },
+            {"role": "tool", "content": "ok", "tool_call_id": "call_1"},
+        ]
+
+        result = budget.trim_history(msgs, token_limit=10_000)
+
+        assert result[1]["tool_calls"] == tool_calls
+        assert result[1]["reasoning_content"] == "I should inspect files."
+        assert result[2]["tool_call_id"] == "call_1"
+
 
 # ===========================================================================
 # ConversationHistory
@@ -297,6 +321,31 @@ class TestConversationHistory:
         h = ConversationHistory.from_dicts(dicts)
         assert h.message_count == 2
         assert h.to_list()[0].content == "task"
+
+    def test_protocol_metadata_round_trips(self):
+        tool_calls = [{
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "shell", "arguments": '{"cmd": "ls"}'},
+        }]
+        h = ConversationHistory()
+        h.add(LLMMessage(
+            role="assistant",
+            content="",
+            reasoning_content="I should inspect files.",
+            tool_calls=tool_calls,
+        ))
+        h.add(LLMMessage(
+            role="tool",
+            content="ok",
+            tool_call_id="call_1",
+        ))
+
+        restored = ConversationHistory.from_dicts(h.to_dicts())
+        messages = restored.to_list()
+        assert messages[0].reasoning_content == "I should inspect files."
+        assert messages[0].tool_calls == tool_calls
+        assert messages[1].tool_call_id == "call_1"
 
     def test_add_many(self):
         h = ConversationHistory(max_messages=5)
@@ -361,6 +410,180 @@ class TestCoreWithContext:
             result = agent.run(task, log)
 
         assert result.is_success()
+
+    def test_native_tool_call_history_is_passed_to_next_turn(self, tmp_path):
+        from agent.core import Agent, AgentConfig
+        from agent.event_log import EventLog
+
+        class NativeToolBackend(LLMBackend):
+            def __init__(self):
+                self.received_messages = []
+                self.call_count = 0
+
+            @property
+            def model_name(self) -> str:
+                return "deepseek-v4-pro"
+
+            def complete(self, messages, tools):
+                self.received_messages.append(messages)
+                self.call_count += 1
+                if self.call_count == 1:
+                    tool_calls = [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "shell",
+                            "arguments": '{"cmd": "ls"}',
+                        },
+                    }]
+                    return LLMResponse(
+                        action=Action(
+                            ActionType.TOOL_CALL,
+                            "I should inspect files.",
+                            ToolCall("shell", {"cmd": "ls"}, id="call_1"),
+                        ),
+                        raw_content="I should inspect files.",
+                        assistant_message=LLMMessage(
+                            role="assistant",
+                            content="",
+                            reasoning_content="I should inspect files.",
+                            tool_calls=tool_calls,
+                        ),
+                    )
+                return LLMResponse(
+                    action=Action(ActionType.FINISH, "done", message="ok"),
+                    raw_content="ok",
+                )
+
+        task = self._make_task(tmp_path)
+        registry = ToolRegistry().register(NoopTool("shell"))
+        backend = NativeToolBackend()
+        config = AgentConfig(budget_tokens=80_000, history_max_messages=20)
+        agent = Agent(backend, registry, config)
+
+        with EventLog.create(task, log_dir=str(tmp_path / "logs")) as log:
+            result = agent.run(task, log)
+
+        assert result.is_success()
+        assert backend.call_count == 2
+        second_messages = backend.received_messages[1]
+        assistant = next(m for m in second_messages if m.role == "assistant" and m.tool_calls)
+        tool = next(m for m in second_messages if m.role == "tool")
+        assert assistant.reasoning_content == "I should inspect files."
+        assert assistant.tool_calls[0]["id"] == "call_1"
+        assert tool.tool_call_id == "call_1"
+        assert "[UNTRUSTED TOOL OUTPUT BEGIN]" in tool.content
+
+    def test_multiple_native_tool_calls_append_matching_tool_messages(self, tmp_path):
+        from agent.core import Agent, AgentConfig
+        from agent.event_log import EventLog
+
+        class MultiToolBackend(LLMBackend):
+            def __init__(self):
+                self.received_messages = []
+                self.call_count = 0
+
+            @property
+            def model_name(self) -> str:
+                return "deepseek-v4-pro"
+
+            def complete(self, messages, tools):
+                self.received_messages.append(messages)
+                self.call_count += 1
+                if self.call_count == 1:
+                    raw_tool_calls = [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "shell",
+                                "arguments": '{"cmd": "ls"}',
+                            },
+                        },
+                        {
+                            "id": "call_2",
+                            "type": "function",
+                            "function": {
+                                "name": "git_commit",
+                                "arguments": '{"message": "test"}',
+                            },
+                        },
+                    ]
+                    calls = [
+                        ToolCall("shell", {"cmd": "ls"}, id="call_1"),
+                        ToolCall("git_commit", {"message": "test"}, id="call_2"),
+                    ]
+                    return LLMResponse(
+                        action=Action(
+                            action_type=ActionType.TOOL_CALL,
+                            thought="I should run two independent actions.",
+                            tool_call=calls[0],
+                            tool_calls=calls,
+                        ),
+                        raw_content="I should run two independent actions.",
+                        assistant_message=LLMMessage(
+                            role="assistant",
+                            content="",
+                            reasoning_content="I should run two independent actions.",
+                            tool_calls=raw_tool_calls,
+                        ),
+                    )
+                return LLMResponse(
+                    action=Action(ActionType.FINISH, "done", message="ok"),
+                    raw_content="ok",
+                )
+
+        task = self._make_task(tmp_path)
+        registry = ToolRegistry().register(NoopTool("shell"))
+        backend = MultiToolBackend()
+        agent = Agent(backend, registry, AgentConfig(budget_tokens=80_000))
+
+        with EventLog.create(task, log_dir=str(tmp_path / "logs")) as log:
+            result = agent.run(task, log)
+
+        assert result.is_success()
+        second_messages = backend.received_messages[1]
+        tool_messages = [m for m in second_messages if m.role == "tool"]
+        assert [m.tool_call_id for m in tool_messages] == ["call_1", "call_2"]
+        assert "Status: SUCCESS" in tool_messages[0].content
+        assert "Action requires confirmation" in tool_messages[1].content
+
+    def test_multiple_tool_calls_trigger_test_reflection_once(self, tmp_path):
+        from agent.core import Agent, AgentConfig
+        from agent.event_log import EventLog
+        from agent.task import EventType
+
+        task = self._make_task(tmp_path)
+        registry = (
+            ToolRegistry()
+            .register(FailingTool("test"))
+            .register(NoopTool("shell"))
+        )
+        calls = [
+            ToolCall("test", {}, id="call_1"),
+            ToolCall("shell", {"cmd": "ls"}, id="call_2"),
+        ]
+        script = [
+            Action(
+                action_type=ActionType.TOOL_CALL,
+                thought="run checks",
+                tool_call=calls[0],
+                tool_calls=calls,
+            ),
+            Action(ActionType.FINISH, "done", message="ok"),
+        ]
+        backend = MockBackend(script)
+        agent = Agent(backend, registry, AgentConfig(budget_tokens=80_000))
+
+        with EventLog.create(task, log_dir=str(tmp_path / "logs")) as log:
+            result = agent.run(task, log)
+            events = log.replay()
+
+        assert result.is_success()
+        reflections = [e for e in events if e.event_type == EventType.REFLECTION]
+        assert len(reflections) == 1
+        observations = [e for e in events if e.event_type == EventType.OBSERVATION]
+        assert len(observations) == 2
 
     def test_repo_map_injected_in_system_prompt(self, tmp_path):
         """repo_map 生成的内容应出现在发给 LLM 的 system prompt 里。"""

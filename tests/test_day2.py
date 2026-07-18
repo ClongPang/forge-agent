@@ -333,6 +333,46 @@ class TestAgentFinish:
         assert result.status == RunStatus.SUCCESS
         assert result.steps_taken == 3
 
+    def test_finish_with_tool_markers_triggers_reflection_and_continues(
+        self, task, log, registry
+    ):
+        from agent.task import EventType
+
+        bad_finish = make_finish_action(
+            'I still need context.\nAction: file_read\nParams: {"path": "agent/core.py"}'
+        )
+        script = [
+            bad_finish,
+            make_tool_call_action("shell", {"cmd": "ls"}),
+            make_finish_action("Done after real tool use."),
+        ]
+        backend = MockBackend(script)
+        agent = Agent(backend, registry)
+
+        result = agent.run(task, log)
+
+        assert result.status == RunStatus.SUCCESS
+        assert result.summary == "Done after real tool use."
+        assert result.steps_taken == 3
+        assert backend.call_count == 3
+
+        events = log.replay()
+        reflections = [e for e in events if e.event_type == EventType.REFLECTION]
+        assert reflections
+        assert reflections[0].payload["reason"] == "finish_contains_tool_markers"
+        task_completes = [e for e in events if e.event_type == EventType.TASK_COMPLETE]
+        assert len(task_completes) == 1
+
+    def test_finish_without_tool_marker_pair_still_succeeds(self, task, log, registry):
+        backend = MockBackend([
+            make_finish_action("Action: summarize findings without params marker")
+        ])
+        agent = Agent(backend, registry)
+
+        result = agent.run(task, log)
+
+        assert result.status == RunStatus.SUCCESS
+
     def test_event_log_records_correct_sequence(self, task, log, registry):
         from agent.task import EventType
 
