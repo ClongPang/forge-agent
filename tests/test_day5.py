@@ -41,6 +41,18 @@ def py_repo(tmp_path) -> Path:
     return tmp_path
 
 
+def _raw_tool_call(
+    call_id: str,
+    name: str = "shell",
+    arguments: str = '{"cmd": "ls"}',
+) -> dict:
+    return {
+        "id": call_id,
+        "type": "function",
+        "function": {"name": name, "arguments": arguments},
+    }
+
+
 # ===========================================================================
 # estimate_tokens
 # ===========================================================================
@@ -256,11 +268,7 @@ class TestTokenBudget:
 
     def test_trim_history_preserves_protocol_metadata(self):
         budget = TokenBudget(total=10_000)
-        tool_calls = [{
-            "id": "call_1",
-            "type": "function",
-            "function": {"name": "shell", "arguments": '{"cmd": "ls"}'},
-        }]
+        tool_calls = [_raw_tool_call("call_1")]
         msgs = [
             {"role": "user", "content": "task"},
             {
@@ -277,6 +285,99 @@ class TestTokenBudget:
         assert result[1]["tool_calls"] == tool_calls
         assert result[1]["reasoning_content"] == "I should inspect files."
         assert result[2]["tool_call_id"] == "call_1"
+
+    def test_trim_history_drops_orphan_tool_message(self):
+        budget = TokenBudget(total=10_000)
+        msgs = [
+            {"role": "user", "content": "task"},
+            {"role": "tool", "content": "orphan", "tool_call_id": "call_1"},
+            {"role": "user", "content": "next"},
+        ]
+
+        result = budget.trim_history(msgs, token_limit=10_000)
+
+        assert all(m["role"] != "tool" for m in result)
+        assert result[-1]["content"] == "next"
+
+    def test_trim_history_drops_assistant_tool_calls_without_ids(self):
+        budget = TokenBudget(total=10_000)
+        msgs = [
+            {"role": "user", "content": "task"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "type": "function",
+                    "function": {"name": "shell", "arguments": "{}"},
+                }],
+            },
+            {"role": "user", "content": "next"},
+        ]
+
+        result = budget.trim_history(msgs, token_limit=10_000)
+
+        assert all("tool_calls" not in m for m in result)
+        assert result[-1]["content"] == "next"
+
+    def test_trim_history_keeps_tool_call_block_atomic(self):
+        budget = TokenBudget(total=10_000)
+        tool_calls = [_raw_tool_call("call_1")]
+        msgs = [
+            {"role": "user", "content": "task"},
+            {"role": "user", "content": "older"},
+            {
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": "I should inspect files.",
+                "tool_calls": tool_calls,
+            },
+            {"role": "tool", "content": "ok", "tool_call_id": "call_1"},
+        ]
+
+        result = budget.trim_history(msgs, token_limit=10_000)
+
+        assert result[-2]["tool_calls"] == tool_calls
+        assert result[-2]["reasoning_content"] == "I should inspect files."
+        assert result[-1]["tool_call_id"] == "call_1"
+
+    def test_trim_history_drops_oversized_tool_call_block_as_unit(self):
+        budget = TokenBudget(total=10_000)
+        tool_calls = [_raw_tool_call("call_1")]
+        msgs = [
+            {"role": "user", "content": "task"},
+            {"role": "user", "content": "recent"},
+            {
+                "role": "assistant",
+                "content": "x" * 2000,
+                "tool_calls": tool_calls,
+            },
+            {"role": "tool", "content": "ok", "tool_call_id": "call_1"},
+        ]
+
+        result = budget.trim_history(msgs, token_limit=20)
+
+        assert all("tool_calls" not in m for m in result)
+        assert all(m.get("tool_call_id") != "call_1" for m in result)
+
+    def test_trim_history_keeps_multiple_tool_results_atomic(self):
+        budget = TokenBudget(total=10_000)
+        tool_calls = [
+            _raw_tool_call("call_1"),
+            _raw_tool_call("call_2", name="test", arguments="{}"),
+        ]
+        msgs = [
+            {"role": "user", "content": "task"},
+            {"role": "assistant", "content": "", "tool_calls": tool_calls},
+            {"role": "tool", "content": "files", "tool_call_id": "call_1"},
+            {"role": "tool", "content": "tests", "tool_call_id": "call_2"},
+        ]
+
+        result = budget.trim_history(msgs, token_limit=10_000)
+
+        assert [m.get("tool_call_id") for m in result if m["role"] == "tool"] == [
+            "call_1",
+            "call_2",
+        ]
 
 
 # ===========================================================================
@@ -323,11 +424,7 @@ class TestConversationHistory:
         assert h.to_list()[0].content == "task"
 
     def test_protocol_metadata_round_trips(self):
-        tool_calls = [{
-            "id": "call_1",
-            "type": "function",
-            "function": {"name": "shell", "arguments": '{"cmd": "ls"}'},
-        }]
+        tool_calls = [_raw_tool_call("call_1")]
         h = ConversationHistory()
         h.add(LLMMessage(
             role="assistant",
@@ -346,6 +443,45 @@ class TestConversationHistory:
         assert messages[0].reasoning_content == "I should inspect files."
         assert messages[0].tool_calls == tool_calls
         assert messages[1].tool_call_id == "call_1"
+
+    def test_trim_keeps_tool_call_block_atomic(self):
+        tool_calls = [_raw_tool_call("call_1")]
+        h = ConversationHistory(max_messages=4)
+        h.add(LLMMessage(role="user", content="task"))
+        h.add(LLMMessage(role="user", content="older"))
+        h.add_many([
+            LLMMessage(
+                role="assistant",
+                content="",
+                reasoning_content="inspect",
+                tool_calls=tool_calls,
+            ),
+            LLMMessage(role="tool", content="ok", tool_call_id="call_1"),
+        ])
+        h.add(LLMMessage(role="user", content="newest"))
+
+        messages = h.to_list()
+
+        assert messages[0].content == "task"
+        assert all(m.content != "older" for m in messages)
+        assert [m.tool_call_id for m in messages if m.role == "tool"] == ["call_1"]
+        assert any(m.role == "assistant" and m.tool_calls for m in messages)
+
+    def test_trim_drops_tool_call_block_instead_of_splitting_it(self):
+        tool_calls = [_raw_tool_call("call_1")]
+        h = ConversationHistory(max_messages=3)
+        h.add(LLMMessage(role="user", content="task"))
+        h.add(LLMMessage(role="user", content="older"))
+        h.add_many([
+            LLMMessage(role="assistant", content="", tool_calls=tool_calls),
+            LLMMessage(role="tool", content="ok", tool_call_id="call_1"),
+        ])
+        h.add(LLMMessage(role="user", content="newest"))
+
+        messages = h.to_list()
+
+        assert all(m.tool_call_id != "call_1" for m in messages)
+        assert all(not m.tool_calls for m in messages)
 
     def test_add_many(self):
         h = ConversationHistory(max_messages=5)
@@ -428,14 +564,7 @@ class TestCoreWithContext:
                 self.received_messages.append(messages)
                 self.call_count += 1
                 if self.call_count == 1:
-                    tool_calls = [{
-                        "id": "call_1",
-                        "type": "function",
-                        "function": {
-                            "name": "shell",
-                            "arguments": '{"cmd": "ls"}',
-                        },
-                    }]
+                    tool_calls = [_raw_tool_call("call_1")]
                     return LLMResponse(
                         action=Action(
                             ActionType.TOOL_CALL,
@@ -474,6 +603,85 @@ class TestCoreWithContext:
         assert tool.tool_call_id == "call_1"
         assert "[UNTRUSTED TOOL OUTPUT BEGIN]" in tool.content
 
+    def test_native_tool_call_history_trim_stays_protocol_safe(self, tmp_path):
+        from agent.core import Agent, AgentConfig
+        from agent.event_log import EventLog
+
+        def assert_protocol_safe(messages):
+            pending = set()
+            for message in messages:
+                if message.role == "assistant":
+                    pending = {
+                        item["id"]
+                        for item in (message.tool_calls or [])
+                        if item.get("id")
+                    }
+                    continue
+                if message.role == "tool":
+                    assert message.tool_call_id in pending
+                    pending.remove(message.tool_call_id)
+                    continue
+                assert not pending
+
+        class TwoToolTurnsBackend(LLMBackend):
+            def __init__(self):
+                self.received_messages = []
+                self.call_count = 0
+
+            @property
+            def model_name(self) -> str:
+                return "deepseek-v4-pro"
+
+            def complete(self, messages, tools):
+                assert_protocol_safe(messages)
+                self.received_messages.append(messages)
+                self.call_count += 1
+                if self.call_count in (1, 2):
+                    call_id = f"call_{self.call_count}"
+                    raw_tool_calls = [_raw_tool_call(call_id)]
+                    return LLMResponse(
+                        action=Action(
+                            ActionType.TOOL_CALL,
+                            "inspect",
+                            ToolCall("shell", {"cmd": "ls"}, id=call_id),
+                        ),
+                        raw_content="inspect",
+                        assistant_message=LLMMessage(
+                            role="assistant",
+                            content="",
+                            reasoning_content="inspect",
+                            tool_calls=raw_tool_calls,
+                        ),
+                    )
+                return LLMResponse(
+                    action=Action(ActionType.FINISH, "done", message="ok"),
+                    raw_content="ok",
+                )
+
+        task = self._make_task(tmp_path)
+        registry = ToolRegistry().register(NoopTool("shell"))
+        backend = TwoToolTurnsBackend()
+        agent = Agent(
+            backend,
+            registry,
+            AgentConfig(budget_tokens=80_000, history_max_messages=4),
+        )
+
+        with EventLog.create(task, log_dir=str(tmp_path / "logs")) as log:
+            result = agent.run(task, log)
+
+        assert result.is_success()
+        assert backend.call_count == 3
+        final_history = backend.received_messages[-1]
+        assert any(
+            m.role == "tool" and m.tool_call_id == "call_2"
+            for m in final_history
+        )
+        assert not any(
+            m.role == "tool" and m.tool_call_id == "call_1"
+            for m in final_history
+        )
+
     def test_multiple_native_tool_calls_append_matching_tool_messages(self, tmp_path):
         from agent.core import Agent, AgentConfig
         from agent.event_log import EventLog
@@ -492,22 +700,12 @@ class TestCoreWithContext:
                 self.call_count += 1
                 if self.call_count == 1:
                     raw_tool_calls = [
-                        {
-                            "id": "call_1",
-                            "type": "function",
-                            "function": {
-                                "name": "shell",
-                                "arguments": '{"cmd": "ls"}',
-                            },
-                        },
-                        {
-                            "id": "call_2",
-                            "type": "function",
-                            "function": {
-                                "name": "git_commit",
-                                "arguments": '{"message": "test"}',
-                            },
-                        },
+                        _raw_tool_call("call_1"),
+                        _raw_tool_call(
+                            "call_2",
+                            name="git_commit",
+                            arguments='{"message": "test"}',
+                        ),
                     ]
                     calls = [
                         ToolCall("shell", {"cmd": "ls"}, id="call_1"),

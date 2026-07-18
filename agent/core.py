@@ -427,13 +427,14 @@ class Agent:
                         steps_without_edit += 1
 
                     if response.assistant_message is not None and all(tc.id for tc, _ in observations):
-                        history.add(response.assistant_message)
+                        native_messages = [response.assistant_message]
                         for tc, observation in observations:
-                            history.add(LLMMessage(
+                            native_messages.append(LLMMessage(
                                 role="tool",
                                 content=self._format_observation_for_history(observation),
                                 tool_call_id=tc.id,
                             ))
+                        history.add_many(native_messages)
                     else:
                         history.add(LLMMessage(
                             role="assistant",

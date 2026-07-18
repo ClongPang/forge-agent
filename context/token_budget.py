@@ -31,6 +31,8 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 
+from context.message_blocks import build_message_blocks, flatten_blocks
+
 # ---------------------------------------------------------------------------
 # Token 计数：优先 tiktoken，失败时字符估算 fallback
 # ---------------------------------------------------------------------------
@@ -167,31 +169,36 @@ class TokenBudget:
     ) -> list[dict]:
         """
         裁剪历史消息列表到 token_limit 以内。
-        保留第一条（任务描述）+ 尽量多的最近消息。
+        保留第一条（任务描述）+ 尽量多的最近协议安全消息块。
         """
         if not messages:
             return messages
 
-        token_counts = [estimate_tokens(_message_token_text(m)) for m in messages]
-        total = sum(token_counts)
+        first_message = messages[0]
+        first_tokens = estimate_tokens(_message_token_text(first_message))
+        blocks, invalid_dropped = build_message_blocks(messages[1:])
+        block_tokens = [
+            sum(estimate_tokens(_message_token_text(m)) for m in block)
+            for block in blocks
+        ]
+        total = first_tokens + sum(block_tokens)
 
-        if total <= token_limit:
+        if invalid_dropped == 0 and total <= token_limit:
             return messages
 
-        result = [messages[0]]
-        remaining_budget = token_limit - token_counts[0]
-        dropped = 0
-        selected = []
-        budget_left = remaining_budget
+        result = [first_message]
+        dropped = invalid_dropped
+        selected_blocks = []
+        budget_left = token_limit - first_tokens
 
-        for msg, tokens in zip(reversed(messages[1:]), reversed(token_counts[1:])):
+        for block, tokens in zip(reversed(blocks), reversed(block_tokens)):
             if budget_left - tokens >= 0:
-                selected.append(msg)
+                selected_blocks.append(block)
                 budget_left -= tokens
             else:
-                dropped += 1
+                dropped += len(block)
 
-        selected.reverse()
+        selected_blocks.reverse()
 
         if dropped > 0:
             result.append({
@@ -199,7 +206,7 @@ class TokenBudget:
                 "content": f"[{dropped} earlier messages were truncated to fit context window]",
             })
 
-        result.extend(selected)
+        result.extend(flatten_blocks(selected_blocks))
         return result
 
     def fit_all(

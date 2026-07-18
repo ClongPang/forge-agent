@@ -17,6 +17,7 @@ context/history.py
 
 from __future__ import annotations
 
+from context.message_blocks import build_message_blocks, flatten_blocks
 from llm.base import LLMMessage
 
 
@@ -98,13 +99,25 @@ class ConversationHistory:
             self._messages = [self._messages[0]]
 
     def _trim(self) -> None:
-        """超出 max_messages 时，从索引 1 开始丢弃最旧的消息。"""
-        while len(self._messages) > self._max:
-            # 保留 index 0（任务描述），从 index 1 开始丢
-            if len(self._messages) > 1:
-                self._messages.pop(1)
-            else:
-                break
+        """超出 max_messages 时，按协议安全消息块裁剪旧历史。"""
+        if len(self._messages) <= self._max:
+            return
+        if len(self._messages) <= 1:
+            return
+
+        first_message = self._messages[0]
+        budget = max(self._max - 1, 0)
+        blocks, _ = build_message_blocks(self._messages[1:])
+        selected_blocks = []
+        used = 0
+
+        for block in reversed(blocks):
+            if used + len(block) <= budget:
+                selected_blocks.append(block)
+                used += len(block)
+
+        selected_blocks.reverse()
+        self._messages = [first_message] + flatten_blocks(selected_blocks)
 
     def __len__(self) -> int:
         return len(self._messages)
