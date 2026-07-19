@@ -7,6 +7,7 @@ from agent.event_log import EventLog
 from agent.task import Action, ActionType, EventType, Task, ToolCall, ToolErrorKind
 from llm.base import MockBackend
 from policy import (
+    PermissionMode,
     PolicyContext,
     PolicyDecisionKind,
     PolicyEngine,
@@ -84,12 +85,89 @@ def test_policy_engine_allows_unknown_tools_for_registry_validation(tmp_path):
 
 def test_policy_engine_requires_confirm_for_non_readonly_shell(tmp_path):
     decision = PolicyEngine().evaluate(
-        ToolIntent("shell", {"cmd": "pip install requests"}),
+        ToolIntent("shell", {"cmd": "python scripts/migrate.py"}),
         _context(tmp_path),
     )
 
     assert decision.kind == PolicyDecisionKind.REQUIRE_CONFIRM
     assert "shell command requires confirmation" in decision.reason.lower()
+    assert decision.mode == PermissionMode.FIX.value
+
+
+def test_fix_mode_denies_package_installs(tmp_path):
+    decision = PolicyEngine(mode="fix").evaluate(
+        ToolIntent("shell", {"cmd": "pip install requests"}),
+        _context(tmp_path),
+    )
+
+    assert decision.kind == PolicyDecisionKind.DENY
+    assert "maintain mode" in decision.reason.lower()
+    assert decision.mode == "fix"
+
+
+def test_maintain_mode_requires_confirm_for_package_installs(tmp_path):
+    decision = PolicyEngine(mode=PermissionMode.MAINTAIN).evaluate(
+        ToolIntent("shell", {"cmd": "pip install requests"}),
+        _context(tmp_path),
+    )
+
+    assert decision.kind == PolicyDecisionKind.REQUIRE_CONFIRM
+    assert "package install" in decision.reason.lower()
+    assert decision.mode == "maintain"
+
+
+def test_fix_and_maintain_modes_deny_raw_network_and_git_push(tmp_path):
+    for mode in ("fix", "maintain"):
+        curl_decision = PolicyEngine(mode=mode).evaluate(
+            ToolIntent("shell", {"cmd": "curl https://example.com"}),
+            _context(tmp_path),
+        )
+        push_decision = PolicyEngine(mode=mode).evaluate(
+            ToolIntent("shell", {"cmd": "git push origin main"}),
+            _context(tmp_path),
+        )
+
+        assert curl_decision.kind == PolicyDecisionKind.DENY
+        assert push_decision.kind == PolicyDecisionKind.DENY
+        assert curl_decision.mode == mode
+
+
+def test_inspect_mode_rejects_writes_tests_and_commits(tmp_path):
+    engine = PolicyEngine(mode="inspect")
+
+    write_decision = engine.evaluate(
+        ToolIntent("file_write", {"path": "app.py", "content": "x"}),
+        _context(tmp_path),
+    )
+    test_decision = engine.evaluate(
+        ToolIntent("test", {"path": "tests/"}),
+        _context(tmp_path),
+    )
+    commit_decision = engine.evaluate(
+        ToolIntent("git_commit", {"message": "test"}),
+        _context(tmp_path),
+    )
+
+    assert write_decision.kind == PolicyDecisionKind.DENY
+    assert test_decision.kind == PolicyDecisionKind.DENY
+    assert commit_decision.kind == PolicyDecisionKind.DENY
+    assert write_decision.mode == "inspect"
+
+
+def test_inspect_mode_allows_readonly_shell_but_denies_pytest(tmp_path):
+    engine = PolicyEngine(mode="inspect")
+
+    read_decision = engine.evaluate(
+        ToolIntent("shell", {"cmd": "git status"}),
+        _context(tmp_path),
+    )
+    pytest_decision = engine.evaluate(
+        ToolIntent("shell", {"cmd": "pytest tests/"}),
+        _context(tmp_path),
+    )
+
+    assert read_decision.kind == PolicyDecisionKind.ALLOW
+    assert pytest_decision.kind == PolicyDecisionKind.DENY
 
 
 def test_policy_engine_allows_readonly_shell(tmp_path):

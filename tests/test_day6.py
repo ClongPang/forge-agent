@@ -7,6 +7,7 @@ GitHub Issue 入口依赖网络，只测纯逻辑部分。
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -232,6 +233,10 @@ class TestCliHelp:
         assert "--repo" in result.output
         assert "--task" in result.output
         assert "--model" in result.output
+        assert "--mode" in result.output
+        assert "--permission-mode" in result.output
+        assert "--verify" in result.output
+        assert "--fail-on-unverified" in result.output
 
     def test_log_help(self):
         runner = CliRunner()
@@ -295,6 +300,93 @@ class TestCliRun:
         result = self._invoke_run(tmp_path)
         assert result.exit_code == 0, result.output
         assert "SUCCESS" in result.output
+
+    def test_run_writes_stable_artifacts(self, tmp_path):
+        result = self._invoke_run(tmp_path)
+        assert result.exit_code == 0, result.output
+
+        artifact_dirs = [
+            path for path in (tmp_path / "logs").iterdir()
+            if path.is_dir()
+        ]
+        assert len(artifact_dirs) == 1
+        artifact_dir = artifact_dirs[0]
+        events_path = artifact_dir / "events.jsonl"
+        report_path = artifact_dir / "report.json"
+        diff_path = artifact_dir / "diff.patch"
+
+        assert events_path.exists()
+        assert report_path.exists()
+        assert diff_path.exists()
+        assert "Report" in result.output
+        assert "Diff" in result.output
+        assert "Events" in result.output
+
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        assert report["schema_version"] == 1
+        assert report["task"]["description"] == "fix it"
+        assert report["result"]["status"] == "success"
+        assert report["result"]["has_patch"] is False
+        assert report["permission_mode"] == "fix"
+        assert report["stats"]["final_status"] == "task_complete"
+        assert report["artifacts"]["report"] == str(report_path)
+
+    def test_run_accepts_permission_mode_alias(self, tmp_path):
+        result = self._invoke_run(
+            tmp_path,
+            extra_args=["--permission-mode", "inspect"],
+        )
+        assert result.exit_code == 0, result.output
+        assert "Mode" in result.output
+        assert "inspect" in result.output
+
+        artifact_dirs = [
+            path for path in (tmp_path / "logs").iterdir()
+            if path.is_dir()
+        ]
+        report = json.loads(
+            (artifact_dirs[0] / "report.json").read_text(encoding="utf-8")
+        )
+        assert report["permission_mode"] == "inspect"
+
+    def test_run_writes_verification_report(self, tmp_path):
+        result = self._invoke_run(
+            tmp_path,
+            extra_args=["--verify", "printf verify-ok"],
+        )
+        assert result.exit_code == 0, result.output
+        assert "Verify" in result.output
+        assert "PASSED" in result.output
+
+        artifact_dirs = [
+            path for path in (tmp_path / "logs").iterdir()
+            if path.is_dir()
+        ]
+        report = json.loads(
+            (artifact_dirs[0] / "report.json").read_text(encoding="utf-8")
+        )
+        verification = report["verification"]
+        assert verification["requested"] is True
+        assert verification["passed"] is True
+        assert verification["commands"][0]["command"] == "printf verify-ok"
+
+    def test_run_fail_on_unverified_fails_without_verify(self, tmp_path):
+        result = self._invoke_run(
+            tmp_path,
+            extra_args=["--fail-on-unverified"],
+        )
+
+        assert result.exit_code != 0
+        assert "NOT_REQUESTED" in result.output
+
+    def test_run_fail_on_unverified_fails_on_verify_failure(self, tmp_path):
+        result = self._invoke_run(
+            tmp_path,
+            extra_args=["--verify", "false", "--fail-on-unverified"],
+        )
+
+        assert result.exit_code != 0
+        assert "FAILED" in result.output
 
     def test_run_shows_model_info(self, tmp_path):
         result = self._invoke_run(tmp_path)

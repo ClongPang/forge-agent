@@ -1,0 +1,139 @@
+# Example advanced policy for Forge Agent.
+#
+# This file documents a deferred policy format. It is not wired into runtime
+# behavior yet. Built-in inspect/fix/maintain modes are already available via
+# CLI. This file is not a per-task contract and should not be required for
+# normal `forgeagent run` usage.
+
+version: 1
+
+# Repository default when the user does not pass a permission mode explicitly.
+default_mode: fix
+
+# Mandatory boundaries. These must not be loosened by modes or CLI grants.
+hard_deny:
+  files:
+    read:
+      - ".env"
+      - ".env.*"
+      - "*.pem"
+      - "*.key"
+      - "id_rsa*"
+      - ".git/config"
+      - ".git-credentials"
+      - "logs/*.jsonl"
+  shell:
+    - "rm -rf"
+    - "mkfs"
+    - "dd if="
+    - "git push"
+    - "curl"
+    - "wget"
+    - "sudo"
+
+modes:
+  # Read-only project inspection.
+  inspect:
+    files:
+      write: deny
+    shell:
+      allow:
+        - "ls"
+        - "pwd"
+        - "cat"
+        - "head"
+        - "tail"
+        - "rg"
+        - "find"
+        - "git status"
+        - "git diff"
+        - "git log"
+      default: confirm
+    network: deny
+    git:
+      commit: deny
+
+  # Default mode for bug fixes and normal code/test edits.
+  fix:
+    files:
+      allow_write:
+        - "**"
+      confirm_write:
+        - "pyproject.toml"
+        - "setup.py"
+        - "requirements*.txt"
+        - "package*.json"
+        - ".github/workflows/*"
+        - "deploy*"
+        - "release*"
+    shell:
+      allow:
+        - "ls"
+        - "pwd"
+        - "rg"
+        - "git status"
+        - "git diff"
+        - "pytest"
+        - "python -m pytest"
+      deny:
+        - "pip install"
+        - "python -m pip install"
+        - "npm install"
+        - "pnpm install"
+        - "uv pip install"
+        - "git push"
+        - "curl"
+        - "wget"
+        - "sudo"
+        - "docker"
+        - "docker-compose"
+      default: confirm
+    network: deny
+    git:
+      add:
+        explicit_paths_only: true
+        confirm_unmodified_by_agent: true
+      commit: confirm
+
+  # Dependency, CI, and repository maintenance mode.
+  maintain:
+    files:
+      allow_write:
+        - "**"
+      confirm_write:
+        - "pyproject.toml"
+        - "setup.py"
+        - "requirements*.txt"
+        - "package*.json"
+        - ".github/workflows/*"
+        - "deploy*"
+        - "release*"
+    shell:
+      allow:
+        - "ls"
+        - "pwd"
+        - "rg"
+        - "git status"
+        - "git diff"
+        - "pytest"
+        - "python -m pytest"
+      confirm:
+        - "pip install"
+        - "python -m pip install"
+        - "npm install"
+        - "pnpm install"
+        - "uv pip install"
+      deny:
+        - "git push"
+        - "curl"
+        - "wget"
+        - "sudo"
+        - "docker"
+        - "docker-compose"
+      default: confirm
+    network: deny
+    git:
+      add:
+        explicit_paths_only: true
+        confirm_unmodified_by_agent: true
+      commit: confirm

@@ -413,6 +413,8 @@ class TestChatCommand:
         assert result.exit_code == 0
         assert "--repo" in result.output
         assert "--model" in result.output
+        assert "--mode" in result.output
+        assert "--permission-mode" in result.output
 
     def test_chat_listed_in_root_help(self):
         from click.testing import CliRunner

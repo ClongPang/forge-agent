@@ -7,7 +7,7 @@ llm:
 
 agent:
   max_steps: 40
-  budget_tokens: 80000
+  budget_tokens: 200000
   log_dir: ./logs
 
 tools:

@@ -1,7 +1,7 @@
 """
 entry/cli.py
 
-命令行入口。
+命令行入口。`run` 是主入口：一次任务、一个仓库、一份可审计日志。
 
 用法：
     # 直接传任务描述
@@ -17,7 +17,7 @@ entry/cli.py
     python -m entry.cli log show logs/abc123_20240101_120000.jsonl
 
 安装为命令行工具后（pyproject.toml 里配置了 scripts）：
-    agent run --repo . --task "fix it"
+    forgeagent run --repo . --task "fix it"
 """
 
 from __future__ import annotations
@@ -170,6 +170,26 @@ def _print_step(event, *, streamed_text: str = "") -> None:
         click.echo(red(bold(f"\n✗ FAILED: {payload.get('reason', '')}\n")))
 
 
+def _print_verification(verification: dict) -> None:
+    """Print a compact post-run verification summary."""
+    if not verification.get("requested"):
+        return
+
+    passed = verification.get("passed") is True
+    status = green("PASSED") if passed else red("FAILED")
+    click.echo(bold("\nVerification"))
+    click.echo(f"  Status: {status}")
+    for item in verification.get("commands", []):
+        cmd = item.get("command", "")
+        item_status = item.get("status", "")
+        label = green("✓") if item_status == "passed" else red("✗")
+        click.echo(f"  {label} {cmd}  [{item_status}]")
+        error = item.get("error")
+        if error:
+            click.echo(dim(f"    {error[:180]}"))
+    click.echo()
+
+
 # ---------------------------------------------------------------------------
 # CLI 主命令组
 # ---------------------------------------------------------------------------
@@ -182,7 +202,7 @@ def _print_step(event, *, streamed_text: str = "") -> None:
 )
 @click.pass_context
 def cli(ctx: click.Context, config: str | None) -> None:
-    """Coding Agent — autonomous code editing and bug fixing."""
+    """Coding Agent runner — secure, auditable repository task execution."""
     # ctx 是 Click 的核心机制，用于在命令组及其子命令之间共享数据
     ctx.ensure_object(dict)
     ctx.obj["config_path"] = config
@@ -194,13 +214,40 @@ def cli(ctx: click.Context, config: str | None) -> None:
 
 @cli.command()
 @click.option("--repo", "-r", default=".", show_default=True, help="Path to the target repository (default: current directory)")
-@click.option("--task", "-t", default=None, help="Task description (natural language)")
-@click.option("--task-file", "-f", default=None, help="Read task description from file")
+@click.option("--task", "-t", default=None, help="Task description for this auditable run")
+@click.option("--task-file", "-f", default=None, help="Read the run task description from file")
 @click.option("--model", "-m", default=None, help="Override LLM model name")
 @click.option("--provider", "-p", default=None, help="Override LLM provider")
+@click.option(
+    "--mode", "--permission-mode",
+    "permission_mode",
+    default="fix",
+    show_default=True,
+    type=click.Choice(["inspect", "fix", "maintain"]),
+    help="Permission mode for this run",
+)
+@click.option(
+    "--verify",
+    "verify_commands",
+    multiple=True,
+    help="Run an explicit verification command after the agent finishes; repeatable",
+)
+@click.option(
+    "--verify-timeout",
+    default=300,
+    show_default=True,
+    type=int,
+    help="Timeout in seconds for each --verify command",
+)
+@click.option(
+    "--fail-on-unverified",
+    is_flag=True,
+    default=False,
+    help="Exit non-zero when verification is missing or not passing",
+)
 @click.option("--max-steps", default=None, type=int, help="Override max steps")
 @click.option("--stream", "-s", is_flag=True, default=True, help="Enable streaming output (default: on)")
-@click.option("--confirm", is_flag=True, default=False, help="Ask confirmation before running dangerous shell commands")
+@click.option("--confirm", is_flag=True, default=False, help="Ask before confirmation-required actions")
 @click.option("--sandbox", is_flag=True, default=False, help="Run commands in Docker sandbox (requires Docker)")
 @click.option("--verbose", "-v", is_flag=True, help="Show debug logs")
 @click.pass_context
@@ -211,13 +258,17 @@ def run(
     task_file: str | None,
     model: str | None,
     provider: str | None,
+    permission_mode: str,
+    verify_commands: tuple[str, ...],
+    verify_timeout: int,
+    fail_on_unverified: bool,
     max_steps: int | None,
     stream: bool,
     confirm: bool,
     sandbox: bool,
     verbose: bool,
 ) -> None:
-    """Run the coding agent on a repository."""
+    """Run one auditable coding-agent task on a repository."""
     # 配置日志
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.WARNING,
@@ -244,12 +295,18 @@ def run(
     if not repo_path.exists():
         click.echo(red(f"Error: repo path does not exist: {repo_path}"), err=True)
         sys.exit(1)
+    if verify_timeout <= 0:
+        click.echo(red("Error: --verify-timeout must be positive"), err=True)
+        sys.exit(1)
 
     # 打印运行信息
-    click.echo(bold(f"\n🤖 Coding Agent"))
+    click.echo(bold(f"\n🤖 Forge Agent — Run Mode"))
     click.echo(f"  Provider : {config.llm.provider}")
     click.echo(f"  Model    : {config.llm.model}")
     click.echo(f"  Repo     : {repo_path}")
+    click.echo(f"  Mode     : {permission_mode}")
+    if verify_commands:
+        click.echo(f"  Verify   : {len(verify_commands)} command(s)")
     click.echo(f"  Max steps: {config.agent.max_steps}\n")
 
     # 构建各组件
@@ -280,8 +337,11 @@ def run(
 
     from agent.core import Agent, AgentConfig
     from agent.event_log import EventLog
+    from agent.run_artifacts import write_run_artifacts
     from agent.task import Task
     from agent.telemetry import build_tracer_from_config
+    from agent.verification import run_verifications
+    from policy import PolicyEngine
     try:
         from context.token_budget import is_tiktoken_available
     except ImportError:
@@ -322,6 +382,7 @@ def run(
         thought_callback=_thought_cb if stream else None,
         confirm_callback=confirm_cb,
         tracer=tracer,
+        policy_engine=PolicyEngine(mode=permission_mode),
     )
     agent = Agent(backend, registry, agent_config)
 
@@ -339,6 +400,8 @@ def run(
 
     # 运行
     t0 = time.time()
+    artifact_paths = None
+    verification = None
     try:
         with EventLog.create(task_obj, log_dir=config.agent.log_dir) as log:
             click.echo(dim(f"  Log: {log.path}\n"))
@@ -347,11 +410,25 @@ def run(
             streamed_text = "".join(streamed_text_parts) if stream else ""
             for event in log.replay():
                 _print_step(event, streamed_text=streamed_text)
+            verification = run_verifications(
+                verify_commands,
+                repo_path=repo_path,
+                runtime=runtime,
+                timeout=verify_timeout,
+            )
+            _print_verification(verification)
+            elapsed = time.time() - t0
+            artifact_paths = write_run_artifacts(
+                task=task_obj,
+                result=result,
+                log=log,
+                duration_seconds=elapsed,
+                permission_mode=permission_mode,
+                verification=verification,
+            )
     finally:
         if getattr(tracer, "flush_on_exit", False):
             tracer.flush()
-
-    elapsed = time.time() - t0
 
     # 打印结果
     click.echo(bold("─" * 60))
@@ -360,11 +437,29 @@ def run(
     click.echo(f"Steps   : {result.steps_taken}")
     click.echo(f"Tokens  : {result.total_tokens:,}")
     click.echo(f"Time    : {elapsed:.1f}s")
+    if verification is not None:
+        verify_status = verification.get("status", "not_requested").upper()
+        if verification.get("requested") or fail_on_unverified:
+            if verification.get("passed") is True:
+                verify_color = green
+            elif verification.get("requested"):
+                verify_color = red
+            else:
+                verify_color = yellow
+            click.echo(f"Verify  : {verify_color(verify_status)}")
+    if artifact_paths is not None:
+        click.echo(f"Report  : {artifact_paths.report}")
+        click.echo(f"Diff    : {artifact_paths.diff}")
+        click.echo(f"Events  : {artifact_paths.events}")
     if result.error:
         click.echo(red(f"Error   : {result.error}"))
     click.echo(bold("─" * 60) + "\n")
 
-    sys.exit(0 if result.is_success() else 1)
+    verification_passed = verification is not None and verification.get("passed") is True
+    exit_success = result.is_success()
+    if fail_on_unverified:
+        exit_success = exit_success and verification_passed
+    sys.exit(0 if exit_success else 1)
 
 
 
@@ -376,6 +471,14 @@ def run(
 @click.option("--repo", "-r", default=".", show_default=True, help="Path to the target repository (default: current directory)")
 @click.option("--model", "-m", default=None, help="Override LLM model name")
 @click.option("--provider", "-p", default=None, help="Override LLM provider")
+@click.option(
+    "--mode", "--permission-mode",
+    "permission_mode",
+    default="fix",
+    show_default=True,
+    type=click.Choice(["inspect", "fix", "maintain"]),
+    help="Permission mode for this chat session",
+)
 @click.option("--max-steps", default=None, type=int, help="Max steps per round")
 @click.option("--sandbox", is_flag=True, default=False, help="Run commands in Docker sandbox (requires Docker)")
 @click.option("--verbose", "-v", is_flag=True, help="Show debug logs")
@@ -385,11 +488,12 @@ def chat(
     repo: str,
     model: str | None,
     provider: str | None,
+    permission_mode: str,
     max_steps: int | None,
     sandbox: bool,
     verbose: bool,
 ) -> None:
-    """Interactive chat mode — continuous conversation with the agent."""
+    """Interactive exploration mode with shared conversation history."""
     import logging
     from entry.chat import ChatSession
 
@@ -439,16 +543,18 @@ def chat(
             repo_path=str(repo_path),
             log_dir=config.agent.log_dir,
             confirm_callback=confirm_cb,   # chat 模式默认开启确认
+            permission_mode=permission_mode,
         )
     except ValueError as e:
         click.echo(red(f"Error: {e}"), err=True)
         sys.exit(1)
 
     # 欢迎信息
-    click.echo(bold(f"\n🤖 Coding Agent — Chat Mode"))
+    click.echo(bold(f"\n🤖 Forge Agent — Chat Mode"))
     click.echo(f"  Provider : {config.llm.provider}")
     click.echo(f"  Model    : {config.llm.model}")
     click.echo(f"  Repo     : {repo_path}")
+    click.echo(f"  Mode     : {permission_mode}")
     click.echo(dim(f"  Type your task. Commands: /exit /stats /clear /help\n"))
 
     # 启用行编辑：退格、方向键、Ctrl+A/E、历史记录（↑↓）
@@ -542,7 +648,7 @@ def chat(
 
 @cli.group("eval")
 def eval_cmd() -> None:
-    """Manage evaluation datasets."""
+    """Manage experimental evaluation datasets."""
 
 
 @eval_cmd.command("add-trace")
@@ -631,7 +737,7 @@ def eval_add_trace(
 
 @cli.group()
 def log() -> None:
-    """Inspect event logs."""
+    """Inspect auditable event logs."""
 
 
 @log.command("show")

@@ -16,6 +16,14 @@ class PolicyDecisionKind(str, Enum):
     REQUIRE_CONFIRM = "require_confirm"
 
 
+class PermissionMode(str, Enum):
+    """Built-in permission bundles for a run."""
+
+    INSPECT = "inspect"
+    FIX = "fix"
+    MAINTAIN = "maintain"
+
+
 @dataclass(frozen=True)
 class ToolIntent:
     """A model-requested tool call before authorization and execution."""
@@ -39,6 +47,7 @@ class PolicyDecision:
     kind: PolicyDecisionKind
     reason: str = ""
     prompt: str = ""
+    mode: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable representation."""
@@ -46,4 +55,5 @@ class PolicyDecision:
             "kind": self.kind.value,
             "reason": self.reason,
             "prompt": self.prompt,
+            "mode": self.mode,
         }

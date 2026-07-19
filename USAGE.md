@@ -1,7 +1,11 @@
 # Forge Agent 使用教程
 
-自主编程智能体，支持对话式代码编辑、自动修复 Bug、运行测试，
-支持 Claude、DeepSeek、OpenAI、Groq、Ollama 多种模型。
+Forge Agent 是一个安全、可审计、可控的 coding agent runner。推荐把一次
+`run` 当作核心执行单元：输入一个任务和一个仓库，产出事件日志、结构化报告和
+代码 diff artifact。
+
+`chat`、GitHub Issue、SWE-bench 和 Langfuse eval 都是围绕这个执行单元的
+辅助入口或高级入口。
 
 ---
 
@@ -9,15 +13,15 @@
 
 1. [安装](#1-安装)
 2. [配置](#2-配置)
-3. [三种使用方式](#3-三种使用方式)
-4. [chat 模式详解](#4-chat-模式详解)
-5. [run 模式详解](#5-run-模式详解)
-6. [GitHub Issue 模式](#6-github-issue-模式)
-7. [SWE-bench 评测准备](#7-swe-bench-评测准备)
-8. [查看运行日志](#8-查看运行日志)
-9. [安全机制](#9-安全机制)
-10. [Docker 沙箱](#10-docker-沙箱)
-11. [写好任务描述的技巧](#11-写好任务描述的技巧)
+3. [主入口：run](#3-主入口run)
+4. [运行产物：artifact](#4-运行产物artifact)
+5. [审计入口：log](#5-审计入口log)
+6. [辅助入口：chat](#6-辅助入口chat)
+7. [安全机制](#7-安全机制)
+8. [Docker 沙箱](#8-docker-沙箱)
+9. [当前产品优先级](#9-当前产品优先级)
+10. [高级和实验入口](#10-高级和实验入口)
+11. [任务描述建议](#11-任务描述建议)
 12. [常见问题](#12-常见问题)
 13. [配置参考](#13-配置参考)
 
@@ -25,48 +29,37 @@
 
 ## 1. 安装
 
-**环境要求：** Python 3.11+、pip
+环境要求：Python 3.11+、pip。Docker 仅在使用 `--sandbox` 时需要。
 
 ```bash
-# 克隆项目
 git clone <repo-url>
 cd forge-agent
 
-# 创建虚拟环境（推荐）
 python -m venv .venv
-source .venv/bin/activate        # macOS/Linux
-# .venv\Scripts\activate         # Windows
-
-# 安装
+source .venv/bin/activate
 pip install -e ".[dev]"
 
-# 验证安装
 forgeagent --help
 ```
 
-**可选：安装更多语言的代码解析支持**（让 repo-map 对更多语言精确分析）
+可选依赖：
 
 ```bash
+# 更多语言的 repo-map 支持
 pip install \
-    tree-sitter-javascript \
-    tree-sitter-typescript \
-    tree-sitter-go \
-    tree-sitter-rust \
-    tree-sitter-java \
-    tree-sitter-cpp \
-    tree-sitter-c \
-    tree-sitter-ruby
-```
+  tree-sitter-javascript \
+  tree-sitter-typescript \
+  tree-sitter-go \
+  tree-sitter-rust \
+  tree-sitter-java \
+  tree-sitter-cpp \
+  tree-sitter-c \
+  tree-sitter-ruby
 
-**可选：安装 tiktoken**（精确 token 计数，网络可访问时推荐）
-
-```bash
+# 精确 token 计数
 pip install tiktoken
-```
 
-**可选：安装 SWE-bench predictions 生成依赖**
-
-```bash
+# SWE-bench prediction 生成
 pip install -e ".[swebench]"
 ```
 
@@ -74,313 +67,431 @@ pip install -e ".[swebench]"
 
 ## 2. 配置
 
-### 2.1 选择模型提供商
+编辑 `config/default.yaml`，配置模型提供商和 API Key。
 
-编辑 `config/default.yaml`，根据你使用的服务商填写：
-
-**DeepSeek（推荐，性价比高）**
+DeepSeek 示例：
 
 ```yaml
 llm:
   provider: deepseek
-  model: deepseek-v4-flash        # 快速版，适合日常任务
-  # model: deepseek-v4-pro        # 旗舰版，适合复杂任务
+  model: deepseek-v4-pro
   api_key: ${DEEPSEEK_API_KEY}
   base_url: https://api.deepseek.com
+  max_tokens: 8192
 ```
 
-**Anthropic Claude**
+常用 provider：
 
 ```yaml
+# Anthropic
 llm:
   provider: anthropic
   model: claude-sonnet-4-5
   api_key: ${ANTHROPIC_API_KEY}
-  base_url:                        # 留空
-```
 
-**OpenAI**
-
-```yaml
+# OpenAI
 llm:
   provider: openai
   model: gpt-4o
   api_key: ${OPENAI_API_KEY}
-  base_url:                        # 留空
-```
 
-**Groq（速度极快，适合调试）**
-
-```yaml
-llm:
-  provider: groq
-  model: llama3-70b-8192
-  api_key: ${GROQ_API_KEY}
-  base_url: https://api.groq.com/openai/v1
-```
-
-**Ollama（本地运行，免费）**
-
-```yaml
+# Ollama
 llm:
   provider: ollama
-  model: llama3               # 本地已拉取的模型名
-  api_key:                    # 留空
+  model: llama3
+  api_key:
   base_url: http://localhost:11434/v1
 ```
 
-### 2.2 设置 API Key
-
-将 API Key 设置为环境变量（**不要**把 Key 明文写进 yaml 文件）：
+不要把真实 key 写进仓库。推荐放在 shell 环境或 `.env`：
 
 ```bash
-# 写进 ~/.bashrc 或 ~/.zshrc，永久生效
-export DEEPSEEK_API_KEY=sk-xxxxxxxxxxxxxxxx
-export ANTHROPIC_API_KEY=sk-ant-xxxxxxxxxxxxxxxx
-export OPENAI_API_KEY=sk-xxxxxxxxxxxxxxxx
-
-# 重新加载（或重开终端）
-source ~/.bashrc
+export DEEPSEEK_API_KEY=sk-xxx
+export ANTHROPIC_API_KEY=sk-ant-xxx
+export OPENAI_API_KEY=sk-xxx
 ```
 
-### 2.3 验证配置
+验证基础联通：
 
 ```bash
 python smoke_test.py
 ```
 
-看到 `✅ COMPLETE` 表示 API 联通、工具执行正常，可以开始使用。
-
 ---
 
-## 3. 三种使用方式
+## 3. 主入口：run
 
-| 方式 | 命令 | 适合场景 |
-|------|------|---------|
-| **chat** | `forgeagent chat` | 持续对话，边改边聊，最常用 |
-| **run** | `forgeagent run --task "..."` | 一次性明确任务，批处理 |
-| **GitHub Issue** | `python -m entry.github_issue` | 自动修复 Issue 并提 PR |
-| **SWE-bench** | `python -m entry.swebench generate` | 批量生成 `predictions.jsonl`，交给官方 harness 评分 |
-
----
-
-## 4. chat 模式详解
-
-### 基本用法
+`run` 是推荐主入口。它适合明确、可验证、可审计的单次任务。
 
 ```bash
-# 在当前目录的项目上启动
-cd /path/to/your/project
-forgeagent chat
+# 当前目录执行一次任务
+forgeagent run --task "fix the failing tests"
 
-# 指定项目目录
-forgeagent chat --repo /path/to/project
+# 只读分析，不允许修改文件或执行测试
+forgeagent run --mode inspect --task "inspect the project architecture"
 
-# 切换模型（不改配置文件）
-forgeagent chat --model deepseek-v4-pro
-forgeagent chat --model gpt-4o --provider openai
+# 指定目标仓库
+forgeagent run --repo /path/to/project --task "add a health check endpoint and tests"
+
+# 用任务文件描述复杂需求
+forgeagent run --repo . --task-file task.txt
+
+# 高风险动作需要终端确认
+forgeagent run --repo . --mode maintain --task "update dependencies and run tests" --confirm
+
+# Docker 沙箱执行
+forgeagent run --repo . --task "run the test suite and fix failures" --sandbox
+
+# 显式验证；验证失败或未验证时返回非零退出码
+forgeagent run --repo . --task "fix the failing tests" \
+  --verify "pytest" --fail-on-unverified
 ```
 
-### 交互界面
+常用选项：
 
-启动后进入交互界面：
-
-```
-🤖 Coding Agent — Chat Mode
-  Provider : deepseek
-  Model    : deepseek-v4-flash
-  Repo     : /your/project
-  Type your task. Commands: /exit /stats /clear /help
-
-you >
-```
-
-直接输入任务描述，按 Enter 发送。支持：
-- **退格键**删除字符
-- **↑↓ 方向键**翻历史输入
-- **Ctrl+A** 跳到行首，**Ctrl+E** 跳到行尾
-
-### 内置命令
-
-| 命令 | 说明 |
-|------|------|
-| `/exit` 或 `/quit` | 退出 |
-| `/stats` | 显示本次会话统计（轮次、步数、Token 消耗） |
-| `/clear` | 清空对话历史，重新开始（不退出） |
-| `/help` | 显示命令帮助 |
-
-### 多轮对话示例
-
-```
-you > 帮我看一下这个项目有哪些模块
-
-  Agent working...
-  （agent 探索文件结构，逐字流式输出分析结果）
-
-  ─── Round 1 · 2 steps · 1,234 tokens · 5.2s ───
-
-you > utils.py 里的 parse_date 函数不能处理空字符串，修一下
-
-  Agent working...
-  （agent 读取文件、修改代码、运行测试）
-
-  ─── Round 2 · 4 steps · 3,421 tokens · 12.1s ───
-
-you > 给这个修复补上单元测试
-
-  ─── Round 3 · 3 steps · 2,890 tokens · 9.3s ───
-
-you > /stats
-
-  Session stats:
-    Rounds  : 3
-    Steps   : 9
-    Tokens  : 7,545
-```
-
-**关键特性：每轮对话结束后历史保留**，agent 下一轮能看到之前做了什么，不需要重复描述上下文。
-
-### 输出结构说明
-
-```
-  Agent working...
-  （流式打印模型思考内容）          ← 模型实时输出，逐字显示
-
-  [1] shell  ls -la                 ← 第1步，调用 shell 工具
-  ✓                                 ← 执行成功
-    main.py utils.py parser.py      ← 输出前几行
-
-  [2] file_read  src/parser.py      ← 第2步，读取文件
-  ✓
-
-  [3] file_write  src/parser.py     ← 第3步，写入修改
-  ✓  Written 42 lines
-
-  [4] test  tests/                  ← 第4步，运行测试
-  ✓  5 passed in 0.12s
-
-  ⟳ Reflection (test_failed)        ← 测试失败时自动反思
-
-  ─── Round 2 · 4 steps · 3,421 tokens · 12.1s ───
-```
-
----
-
-## 5. run 模式详解
-
-适合任务描述明确、不需要来回交互的场景。
-
-### 基本用法
-
-```bash
-# 最简单：在当前目录执行任务
-forgeagent run --task "修复所有 failing 的测试"
-
-# 指定 repo
-forgeagent run --repo /path/to/project --task "重构 api.py，拆分成更小的函数"
-
-# 任务描述写在文件里（推荐用于复杂任务）
-forgeagent run --task-file task.txt
-```
-
-### 所有选项
-
-```
--r, --repo TEXT       目标 repo 路径（默认当前目录）
--t, --task TEXT       任务描述（自然语言）
+```text
+-r, --repo TEXT       目标 repo 路径，默认当前目录
+-t, --task TEXT       任务描述
 -f, --task-file TEXT  从文件读取任务描述
--m, --model TEXT      覆盖模型名
 -p, --provider TEXT   覆盖 provider
-    --max-steps INT   最大步数（默认 40）
--s, --stream          流式输出（默认开启）
-    --confirm         危险命令需要用户确认
-    --sandbox         在 Docker 沙箱里执行命令
+-m, --model TEXT      覆盖模型
+    --mode, --permission-mode [inspect|fix|maintain]
+                       本次 run 的权限模式，默认 fix
+    --verify TEXT      agent 结束后运行的显式验证命令，可重复
+    --verify-timeout INT
+                       单条验证命令超时秒数，默认 300
+    --fail-on-unverified
+                       未提供验证或验证失败时返回非零退出码
+    --max-steps INT   覆盖最大步数
+-s, --stream          启用流式输出，当前默认开启
+    --confirm         需要确认的动作进入终端确认
+    --sandbox         在 Docker 沙箱中执行命令
 -v, --verbose         显示 debug 日志
 ```
 
-### 典型使用场景
+一次 `run` 的结果包括：
+
+- `RunResult`：最终状态、步数、token、错误信息、patch
+- `EventLog`：append-only JSONL，记录 task、action、policy、observation、reflection
+- artifact 目录：固定命名的 `events.jsonl`、`report.json`、`diff.patch`
+- 工作区 diff：agent 对 repo 的实际修改，也会写入 `diff.patch`
+- verification：显式验证命令、退出码、状态、输出摘要
+- 退出码：成功为 `0`，失败为 `1`
+
+### 权限模式
+
+`run` 当前支持三个内置 permission mode：
+
+```text
+inspect   只读分析。允许文件读取、搜索、git status/diff/log 等低风险查看；
+          拒绝文件写入、测试执行、git add/commit 和非只读 shell。
+
+fix       默认模式。允许普通代码/测试修改和测试运行；
+          高风险文件写入、commit、未知写操作需要确认；
+          依赖安装、git push、curl/wget、sudo/docker 会被拒绝。
+
+maintain  维护模式。适合依赖、CI、配置维护；
+          依赖安装从拒绝变为需要确认，git push、curl/wget、sudo/docker 仍拒绝。
+```
+
+依赖安装类任务建议显式使用：
 
 ```bash
-# 修复特定测试
-forgeagent run --task "tests/test_api.py::test_auth 报错 KeyError，修复它"
+forgeagent run --mode maintain --confirm \
+  --task "update Python dependencies and run pytest"
+```
 
-# 添加功能
-forgeagent run --task "在 src/api.py 里添加 /health 接口，返回 {status: ok, version: 1.0}"
+### 验证闭环
 
-# 代码重构
-forgeagent run --task "把 utils.py 里超过 50 行的函数拆分成更小的函数，保持测试通过"
+`--verify` 用来声明 agent 完成后必须运行的验证命令。它可以重复：
 
-# 安全执行（危险命令需确认）
-forgeagent run --task "清理项目，删除所有 .pyc 文件和 __pycache__ 目录" --confirm
+```bash
+forgeagent run --repo . --task "fix the failing tests" \
+  --verify "pytest" \
+  --verify "ruff check" \
+  --fail-on-unverified
+```
 
-# Docker 沙箱（命令在容器里执行，不影响宿主机环境）
-forgeagent run --task "安装依赖并运行测试" --sandbox
+验证结果会写入 `report.json` 的 `verification` 字段。默认情况下，验证失败会被
+记录和打印，但不会改变旧的 agent 退出码语义。加上 `--fail-on-unverified`
+后，以下情况会返回非零退出码：
+
+- 没有提供任何 `--verify`
+- 任一验证命令失败、超时或被安全规则拦截
+- agent 本身失败
+
+验证命令是用户或 CI 显式声明的命令，不是模型生成的工具调用。Forge 仍会拦截：
+
+- shell 控制符：`&&`、`||`、`;`、管道、重定向、命令替换
+- 依赖安装：`pip install`、`npm install`、`poetry add` 等
+- git 写操作：`git add`、`git commit`、`git push`
+- 网络下载和特权命令：`curl`、`wget`、`sudo`、`docker`
+- 敏感文件或仓库外路径引用
+
+常见验证命令：
+
+```bash
+forgeagent run --task "fix tests" --verify "pytest"
+forgeagent run --task "fix frontend tests" --verify "npm test"
+forgeagent run --task "fix Go tests" --verify "go test ./..."
+forgeagent run --task "fix Rust tests" --verify "cargo test"
+forgeagent run --task "fix lint" --verify "ruff check"
+```
+
+推荐验证流程：
+
+```bash
+forgeagent run --repo . --task "fix the failing tests" --sandbox
+forgeagent log list
+forgeagent log show logs/<task_id>_<timestamp>.jsonl
+cat logs/<task_id>_<timestamp>/report.json
+git diff
 ```
 
 ---
 
-## 6. GitHub Issue 模式
+## 4. 运行产物：artifact
 
-自动从 GitHub Issue 拉取任务描述，运行 agent，完成后创建 PR。
+每次 `run` 会保留原始 event log，同时生成一个同名 artifact 目录：
 
-### 准备工作
-
-```bash
-# 设置 GitHub Token（需要 repo 权限）
-export GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxx
+```text
+logs/<task_id>_<timestamp>.jsonl
+logs/<task_id>_<timestamp>/
+  events.jsonl
+  report.json
+  diff.patch
 ```
 
-在 GitHub → Settings → Developer settings → Personal access tokens 创建，
-勾选 `repo` 权限。
+固定文件名是给脚本、CI 和评测系统用的。
 
-### 使用
+- `events.jsonl`：本次 run 的完整事件流副本。
+- `report.json`：机器可读摘要，包含 task、result、stats、changed files、tool calls、policy summary、artifact 路径。
+- `diff.patch`：本次 run 相对运行前 baseline 的 patch；没有新增 diff 时为空文件。
+
+`report.json` 是后续自动化集成的主入口。当前已经包含：
+
+```text
+schema_version
+task
+result.status
+result.steps_taken
+result.total_tokens
+result.has_patch
+result.patch_chars
+permission_mode
+verification
+stats
+duration_seconds
+changed_files
+tool_calls
+policy
+artifacts
+```
+
+---
+
+## 5. 审计入口：log
+
+每次 `run` 或每轮 `chat` 都会在 `config.agent.log_dir` 下生成 JSONL 事件日志。
+
+列出日志：
 
 ```bash
+forgeagent log list
+forgeagent log list --dir ./logs
+```
+
+查看摘要：
+
+```bash
+forgeagent log show logs/abc12345_20260719_120000.jsonl
+```
+
+日志会展示：
+
+- 总事件数
+- action 数
+- reflection 数
+- tool call 统计
+- 最终状态
+- 每个事件的时间、类型和关键状态
+
+日志是标准 JSON Lines，可以用 `jq` 分析：
+
+```bash
+cat logs/abc12345_*.jsonl \
+  | jq 'select(.event_type=="policy_decision") | .payload'
+```
+
+---
+
+## 6. 辅助入口：chat
+
+`chat` 用于本地交互式探索。它复用同一个 `Agent.run()`，但由 `ChatSession`
+跨轮保存对话历史，并默认开启终端确认。
+
+```bash
+forgeagent chat --repo /path/to/project
+forgeagent chat --repo . --model deepseek-v4-pro
+forgeagent chat --repo . --sandbox
+forgeagent chat --repo . --mode maintain
+```
+
+对话内命令：
+
+```text
+/exit   退出
+/stats  查看累计轮次、步数、token
+/clear  清空历史
+/help   显示帮助
+```
+
+`chat` 适合边探索边改。需要可复现、可审计、可集成的任务时，优先写成
+`task.txt` 后用 `run --task-file` 执行。
+
+`chat` 默认同样使用 `fix` mode。需要安装依赖或维护 CI/依赖配置时，显式加
+`--mode maintain`。
+
+---
+
+## 7. 安全机制
+
+Forge Agent 当前有四类默认保护。
+
+### 工作区边界
+
+文件、搜索、测试、git 和可识别 shell 路径默认限制在 `--repo` 指定目录内。
+仓库外路径需要确认；没有确认回调时会拒绝。
+
+会拦截的常见情况：
+
+- `/etc/hosts` 等绝对路径
+- `../` 路径逃逸
+- sibling-prefix 路径混淆
+- 指向仓库外的 symlink
+
+### 敏感文件保护
+
+默认拒绝读取：
+
+- `.env`、`.env.*`
+- `*.pem`、`*.key`、`id_rsa*`
+- `.git/config`、`.git-credentials`
+- `logs/*.jsonl`
+
+`.env.example`、`.env.sample`、`.env.template` 允许读取，用来查看变量名。
+
+### Shell 风险分类
+
+只读白名单命令可直接执行，例如：
+
+```text
+ls, cat, head, tail, pwd, find, rg, grep, git status, git diff,
+git log, pytest, python -m pytest, wc, diff, tree
+```
+
+这些命令若显式引用仓库外路径或敏感文件，仍会被边界和敏感文件策略拦截。
+
+不同 mode 下的高风险命令处理不同：
+
+```text
+fix:
+  confirm: rm, mv, chmod, shell redirection, git commit, unknown write-like commands
+  deny:    pip install, npm install, git push, curl, wget, sudo, docker, docker-compose
+
+maintain:
+  confirm: pip install, npm install, rm, mv, chmod, shell redirection, git commit
+  deny:    git push, curl, wget, sudo, docker, docker-compose
+
+inspect:
+  allow:   low-risk read commands such as ls, rg, git status, git diff
+  deny:    file writes, pytest/test execution, git add/commit, non-readonly shell
+```
+
+明显破坏性命令永远拒绝：
+
+```text
+rm -rf /, rm -rf ~, mkfs, dd if=, fork bomb, chmod -R 777 /, > /dev/sda
+```
+
+### Git 策略
+
+- `git_status`、`git_diff` 是低风险查看操作。
+- `git_add` 必须传显式路径，拒绝 `git add .`。
+- 试图 stage 非本轮 agent 修改过的文件会要求确认。
+- `git_commit` 始终要求确认。
+
+---
+
+## 8. Docker 沙箱
+
+`--sandbox` 会把 shell、pytest、git 放到 Docker 容器里执行。
+
+```bash
+forgeagent run --repo . --task "run tests and fix failures" --sandbox
+forgeagent chat --repo . --sandbox
+```
+
+沙箱行为：
+
+- 使用 `python:3.11-slim`
+- repo bind mount 到 `/workspace`
+- 文件修改会同步回宿主机工作区
+- 容器默认断网
+- session 结束时清理容器
+
+注意：沙箱保护命令执行环境，但 repo 是双向挂载。需要结合 git diff 和 event log
+审计 agent 改了什么。
+
+---
+
+## 9. 当前产品优先级
+
+当前主线不做 Task Contract，也不要求用户在每个任务前写 YAML。
+
+优先级按下面顺序推进：
+
+1. **Run Artifact**：已实现，每次 `run` 稳定产出 `events.jsonl`、`report.json`、`diff.patch`。
+2. **Permission Mode**：已实现，支持 `--mode inspect|fix|maintain`，用代码强制不同运行边界。
+3. **验证闭环**：已实现，支持 `--verify`、`--verify-timeout`、`--fail-on-unverified`，并把验证结果写入 `report.json`。
+
+`forge-policy.yaml` 暂时不是主入口。它只作为未来高级治理能力保留，用于团队级
+hard deny、默认 permission mode 和 CI 非交互规则。设计文档见
+`docs/policy.md`，示例见 `examples/forge-policy.yaml`。
+
+---
+
+## 10. 高级和实验入口
+
+### GitHub Issue 自动修复
+
+```bash
+export GITHUB_TOKEN=ghp_xxx
 python -m entry.github_issue \
-    --repo owner/repo-name \
-    --issue 42 \
-    --local-path /tmp/myrepo
+  --repo owner/repo \
+  --issue 42 \
+  --local-path /tmp/myrepo
 ```
 
-**参数说明：**
+参数：
 
-```
--r, --repo TEXT         GitHub 仓库（格式：owner/repo）
+```text
+-r, --repo TEXT         GitHub repo，格式 owner/repo
 -i, --issue INTEGER     Issue 编号
--l, --local-path TEXT   本地路径（会自动 clone，已存在则直接用）
--c, --config TEXT       配置文件路径
-    --no-pr             只修复代码，不创建 PR
-    --base-branch TEXT  PR 目标分支（默认 main）
--v, --verbose           显示详细日志
+-l, --local-path TEXT   本地路径，已存在则复用
+-c, --config TEXT       配置文件
+    --no-pr             只修复，不创建 PR
+    --base-branch TEXT  PR 目标分支，默认 main
+-v, --verbose           debug 日志
 ```
 
-**执行流程：**
+该入口属于工作流集成。建议在临时 checkout 或受控仓库里使用。
 
-1. 拉取 Issue #42 的标题和描述作为任务
-2. Clone repo 到 `/tmp/myrepo`（已存在则跳过）
-3. 创建新分支 `forgeagent/fix-issue-42-xxxxxxxx`
-4. 在新分支上运行 agent 完成任务
-5. Push 分支到远端
-6. 自动创建 PR，标题和描述自动生成
-
----
-
-## 7. SWE-bench 评测准备
-
-Forge Agent 只负责生成 SWE-bench 官方需要的 `predictions.jsonl`。
-正式评分由官方 SWE-bench harness 在 Docker 环境中完成。
-
-### 生成 predictions
-
-先在本项目环境安装可选依赖：
+### SWE-bench Predictions
 
 ```bash
 pip install -e ".[swebench]"
-```
 
-生成 Lite dev 的单条预测，适合先验证流程：
-
-```bash
 python -m entry.swebench generate \
   --dataset-name princeton-nlp/SWE-bench_Lite \
   --split dev \
@@ -389,109 +500,14 @@ python -m entry.swebench generate \
   --output runs/swebench/dev_predictions.jsonl
 ```
 
-常用选项：
+生成器输出：
 
-```bash
-python -m entry.swebench generate \
-  --split dev \
-  --instance-ids sympy__sympy-20590 \
-  --output runs/swebench/dev_predictions.jsonl \
-  --model deepseek-v4-pro \
-  --max-steps 60
-```
+- `predictions.jsonl`：给官方 SWE-bench harness 使用
+- `*.metadata.jsonl`：记录状态、token、步数、日志路径、patch 大小
 
-生成器会写两个文件：
+正式评分仍由官方 SWE-bench harness 执行。
 
-- `predictions.jsonl`：提交给官方 harness 的 patch 文件
-- `*.metadata.jsonl`：Forge Agent 的状态、token、步数、日志路径和 patch 大小
-
-### 官方评分
-
-把 `predictions.jsonl` 复制到安装了 SWE-bench 的 Linux x86_64 机器上：
-
-```bash
-python -m swebench.harness.run_evaluation \
-  --dataset_name princeton-nlp/SWE-bench_Lite \
-  --split dev \
-  --predictions_path /path/to/dev_predictions.jsonl \
-  --max_workers 2 \
-  --run_id forgeagent-lite-dev
-```
-
-`entry.swebench` 不读取 gold `patch`、`test_patch`、`FAIL_TO_PASS` 或
-`PASS_TO_PASS` 给 agent。它只把 `problem_statement` 和代码仓库交给 agent，
-然后从 `git diff HEAD` 抽取 patch。
-
----
-
-## 8. 查看运行日志
-
-每次运行会在 `./logs/` 目录下生成 JSONL 格式的事件日志，记录完整的运行过程。
-
-### 列出日志文件
-
-```bash
-forgeagent log list
-forgeagent log list --dir ./logs    # 指定日志目录
-```
-
-输出示例：
-
-```
-Log files in ./logs:
-
-  abc12345_20250525_143022.jsonl  (12.3 KB)
-  def67890_20250524_091534.jsonl  (8.7 KB)
-```
-
-### 查看单次运行详情
-
-```bash
-forgeagent log show logs/abc12345_20250525_143022.jsonl
-```
-
-输出示例：
-
-```
-Event Log: abc12345_20250525_143022.jsonl
-  Total events : 18
-  Actions      : 6
-  Reflections  : 1
-  Tool calls   : {'shell': 2, 'file_read': 1, 'file_write': 1, 'test': 2}
-  Final status : task_complete
-
-Events:
-  14:30:22  task_start
-  14:30:25  action          tool=shell
-  14:30:25  observation     status=success
-  14:30:28  action          tool=file_read
-  ...
-  14:30:51  task_complete
-```
-
-日志文件是标准 JSON Lines 格式，每行一个事件，可以用任何工具分析：
-
-```bash
-# 用 jq 查看所有 action
-cat logs/abc12345_*.jsonl | jq 'select(.event_type=="action") | .payload.action.thought'
-
-# 统计工具调用次数
-cat logs/abc12345_*.jsonl | jq 'select(.event_type=="action") | .payload.action.tool_call.name' | sort | uniq -c
-```
-
-### 将 Langfuse trace 加入回归数据集
-
-启用 Langfuse 观测后，可以把一次 trace URL 或 trace id 沉淀为数据集样本：
-
-```bash
-forgeagent eval add-trace "https://cloud.langfuse.com/project/.../traces?traceId=..."
-```
-
-默认写入 `forge-agent/regression` 数据集；如果 URL 带有 `peek` 和 `observation`
-参数，命令会自动把 `peek` 作为 dataset source observation，把当前选中的
-`observation` 记录到 metadata 里，便于之后做回归测试和失败分析。
-
-常用选项：
+### Langfuse Trace 到回归数据集
 
 ```bash
 forgeagent eval add-trace TRACE_OR_URL \
@@ -500,347 +516,156 @@ forgeagent eval add-trace TRACE_OR_URL \
   --notes "final answer contained unexecuted tool syntax"
 ```
 
----
-
-## 9. 安全机制
-
-Agent 有四层保护，防止误操作：
-
-### 层 1：硬拦截黑名单（永远不执行，不问用户）
-
-以下命令会被直接拒绝，任何情况下都不执行：
-
-- `rm -rf /`、`rm -rf ~`
-- `mkfs`（格式化磁盘）
-- `dd if=`（磁盘写入）
-- `:(){:|:&};:`（fork bomb）
-- `chmod -R 777 /`
-- `> /dev/sda`
-
-### 层 2：工作区边界
-
-文件、搜索、测试、git 和可识别的 shell 路径默认以 `--repo` 指定的目录为工作区。
-仓库内路径直接允许；仓库外路径需要确认。没有确认回调时（例如非交互 run
-或 GitHub Issue 自动化流程），仓库外路径会被拒绝。
-
-这会拦截常见逃逸方式：绝对路径（如 `/etc/hosts`）、`../`、repo sibling
-前缀路径、以及指向仓库外的 symlink。
-
-### 层 3：严格只读白名单（直接执行，不需确认）
-
-以下命令被认为是低风险只读操作，直接执行：
-
-`ls`、`cat`、`grep`（非递归）、`rg`（不绕过 ignore/hidden 规则）、`find`、`git status`、`git diff`、`git log`、
-`pytest`、`python -m pytest`、`echo`、`pwd`、`diff`、`tree` 等
-
-如果只读命令显式引用仓库外路径（如 `cat /etc/hosts`），仍然会触发工作区边界确认。
-如果显式引用 `.env`、私钥、`.git/config`、`logs/*.jsonl` 等敏感文件，会直接拒绝。
-递归 `grep -r`、`rg --hidden`、`rg --no-ignore` 会进入确认路径。
-
-### 层 4：高风险动作确认（仅在 `--confirm` 模式下）
-
-以下命令需要用户确认：
-
-`rm`、`mv`、`pip install`、`git commit`、`git push`、`curl`、`wget`、
-`chmod`、`sudo`、`docker`、重定向覆盖（`>`）等
-
-**默认行为（不加 `--confirm`）**：需要确认的动作会被拒绝；只读低风险命令仍可直接执行。
-
-**开启确认（加 `--confirm`）**：遇到写操作会提示：
-
-```
-  ⚠  Agent wants to run:
-     $ git commit -m "fix parser bug"
-  Allow? [y/N]
-```
-
-**chat 模式默认开启确认**，每次执行危险命令或访问仓库外路径都会询问。
+用于把失败 trace 固化成回归样本，后续评估是否修复同类问题。
 
 ---
 
-## 10. Docker 沙箱
+## 11. 任务描述建议
 
-加 `--sandbox` 参数，所有 shell 命令、测试、git 操作都在 Docker 容器里执行，
-宿主机环境完全隔离。
+好任务应该可验证、边界清楚。
 
-### 前提
+推荐模板：
 
-确保 Docker Desktop 已安装并运行：
+```text
+[文件/模块] 的 [函数/类/行为] 在 [输入/场景] 下出现 [错误/不符合预期]。
+期望行为是 [具体结果]。
+请修改实现，并运行 [测试命令] 验证。
+限制：[不要改测试/不要新增依赖/不要改公开 API]。
+```
+
+例子：
 
 ```bash
-docker --version
-docker info    # 应该能正常输出
+forgeagent run --repo . --task \
+  "src/parser.py 的 parse() 在输入空字符串时抛 ValueError，期望返回 None。
+   修复实现，并补充 tests/test_parser.py 的对应测试。运行 pytest tests/test_parser.py。"
 ```
 
-### 使用
-
-```bash
-# run 模式开启沙箱
-forgeagent run --task "安装依赖并运行所有测试" --sandbox
-
-# chat 模式开启沙箱
-forgeagent chat --sandbox
-```
-
-首次使用会拉取 `python:3.11-slim` 镜像（约 150MB），之后复用。
-
-### 沙箱特性
-
-- 容器默认**断网**（`--network none`），防止 agent 随意发网络请求
-- repo 目录通过 bind mount 挂载进容器，**文件修改双向可见**
-  - 宿主机写的文件，容器里能读到
-  - 容器里修改的文件，宿主机立刻看到
-- 容器在 session 结束时**自动清理**
-
----
-
-## 11. 写好任务描述的技巧
-
-任务描述的质量直接决定 agent 的效果。
-
-### 基本原则：具体 > 模糊
-
-```bash
-# ❌ 太模糊，agent 不知道从哪里下手
-forgeagent run --task "fix bug"
-
-# ✅ 具体说明文件、现象、预期结果
-forgeagent run --task "src/parser.py 的 parse() 函数在输入空字符串时抛 ValueError，
-应该返回 None。修复它并在 tests/test_parser.py 里补上这个 case 的测试。"
-```
-
-### 描述模板
-
-```
-[文件/模块]里的[函数/类]在[什么情况]下[出现什么问题]，
-应该[预期行为]。
-[可选：修复后运行什么测试验证]
-```
-
-### 常见任务写法
-
-**修复 Bug：**
-```
-tests/test_api.py::test_auth_token 报错 KeyError: 'user_id'。
-原因可能在 src/auth.py 的 verify_token() 函数里。
-修复它，确保测试通过。
-```
-
-**添加功能：**
-```
-在 src/api.py 里添加 GET /api/v1/health 接口，
-返回 JSON：{"status": "ok", "version": "1.0.0", "timestamp": <当前UTC时间>}。
-同时在 tests/test_api.py 里补上这个接口的测试。
-```
-
-**重构代码：**
-```
-src/utils.py 里的 process_data() 函数现在有 200 行，太长了。
-把它拆分成几个职责单一的小函数，保持所有现有测试通过。
-不要改变函数的对外接口。
-```
-
-**代码审查式任务：**
-```
-帮我检查 src/ 目录下所有 Python 文件，找出：
-1. 没有类型注解的公开函数
-2. 超过 50 行的函数
-3. 重复的代码片段
-列出清单就好，不需要修改。
-```
-
-### 复杂任务用文件
+复杂任务建议写入文件：
 
 ```bash
 cat > task.txt << 'EOF'
-重构 src/database.py 模块：
+重构 src/database.py：
 
-1. 当前问题：
-   - DatabaseManager 类有 15 个方法，职责不清晰
-   - 连接池逻辑和查询逻辑混在一起
-   - 没有错误处理
-
-2. 目标：
-   - 拆分成 ConnectionPool、QueryExecutor 两个类
-   - 每个类不超过 8 个方法
-   - 添加适当的异常处理（用自定义异常类）
-   - 保持现有的所有测试通过
-
-3. 不要改变：
-   - 对外的 API 接口（其他模块 import 的部分）
-   - tests/ 目录下的任何文件
+1. 保持公开 API 不变。
+2. 将连接池逻辑和查询逻辑拆开。
+3. 不要修改 tests/ 目录。
+4. 完成后运行 pytest tests/test_database.py。
 EOF
 
-forgeagent run --task-file task.txt
+forgeagent run --repo . --task-file task.txt --sandbox
 ```
 
 ---
 
 ## 12. 常见问题
 
-**Q：agent 没有任何输出，卡住了**
+**Q：为什么主推 run，不主推 chat？**
 
-先跑 `python smoke_test.py` 检查 API 是否联通。如果网络正常但还是卡，
-可能是模型响应慢，加 `--verbose` 看详细日志：
+`run` 有明确输入、明确结束、明确日志、明确 patch 和退出码，更适合做安全审计、
+CI、评测和团队受控执行。`chat` 适合人工探索，但多轮历史会让边界更模糊。
+
+**Q：不加 `--confirm` 会怎样？**
+
+低风险只读操作可以执行。需要确认的高风险动作会被拒绝。这是非交互 `run` 的
+fail-closed 默认行为。
+
+**Q：agent 修改了文件但我不满意，怎么撤销？**
+
+Forge Agent 不会默认 push。用 git 查看和撤销：
+
 ```bash
-forgeagent chat --verbose
+git diff
+git checkout -- path/to/file.py
 ```
 
-**Q：agent 陷入循环，一直重复同样的操作**
+**Q：沙箱里没有依赖怎么办？**
 
-内置循环检测会自动处理（连续 3 步完全相同的操作会触发 GIVE_UP）。
-如果想提前中断，按 `Ctrl+C`，然后 `/clear` 清空历史重新描述任务。
+可以让 agent 在沙箱中安装，或先在任务里明确安装步骤：
 
-**Q：测试失败后 agent 怎么处理**
-
-内置 Reflection 机制：测试失败时 agent 会自动重新分析错误原因，
-尝试不同的修复策略，最多继续尝试直到达到 `max_steps` 上限。
-
-**Q：修改了文件但不满意，怎么撤销**
-
-agent 不自动 commit，所有修改都在工作区。直接用 git 撤销：
 ```bash
-git checkout -- .          # 撤销所有未提交的修改
-git checkout -- src/foo.py # 撤销特定文件
+forgeagent run --repo . --task \
+  "先运行 pip install -r requirements.txt，再运行 pytest 并修复失败" \
+  --mode maintain --sandbox --confirm
 ```
 
-**Q：token 消耗太多**
+**Q：如何判断一次 run 好不好？**
 
-几个节省 token 的方法：
-```bash
-# 用 flash 版本替代 pro 版本
-forgeagent chat --model deepseek-v4-flash
+建议先看：
 
-# 缩小 repo-map 预算（减少上下文注入量）
-# 编辑 config/default.yaml：
-context:
-  repo_map_budget: 4000    # 从 8000 降到 4000
-
-# 减少历史窗口
-context:
-  history_window: 10       # 从 20 降到 10
-```
-
-**Q：沙箱模式里没有项目需要的依赖**
-
-在任务描述里告诉 agent 先安装：
-```bash
-forgeagent run --task "先运行 pip install -r requirements.txt，然后运行所有测试" --sandbox
-```
-或者用 setup_cmds 在容器启动时预装（需要在代码里配置）。
-
-**Q：GitHub Issue 模式提 PR 失败**
-
-检查 GITHUB_TOKEN 是否有 `repo` 权限。如果只想修代码不提 PR：
-```bash
-python -m entry.github_issue --repo owner/repo --issue 42 \
-    --local-path /tmp/myrepo --no-pr
-```
+- 是否完成任务
+- 测试是否通过
+- policy violation 是否为 0
+- EventLog 是否能解释每一步
+- diff 是否只包含必要修改
 
 ---
 
 ## 13. 配置参考
 
-`config/default.yaml` 完整说明：
-
-```yaml
-llm:
-  provider: deepseek          # 模型提供商
-  model: deepseek-v4-flash    # 模型名
-  api_key: ${DEEPSEEK_API_KEY}  # 环境变量引用
-  base_url: https://api.deepseek.com  # OpenAI-compatible 时填写
-  max_tokens: 4096            # 最大输出 token 数
-
-agent:
-  max_steps: 40               # 每轮最大步数（超出则停止）
-  budget_tokens: 80000        # 每轮 token 预算
-  log_dir: ./logs             # 日志目录
-
-tools:
-  shell:
-    timeout: 30               # shell 命令超时秒数
-    max_output_tokens: 8000   # 输出截断长度（防止超长输出爆上下文）
-  file:
-    max_view_lines: 100       # file_view 每次显示的最大行数
-
-context:
-  repo_map_budget: 8000       # repo-map 注入 system prompt 的最大 token 数
-  history_window: 20          # 保留最近 N 轮对话历史
-```
-
-### 多环境配置
-
-可以维护多个配置文件，用 `-c` 参数指定：
-
-```bash
-# 日常开发用 flash（快且省钱）
-forgeagent chat -c config/dev.yaml
-
-# 复杂任务用 pro
-forgeagent run --task "..." -c config/pro.yaml
-```
-
-`config/dev.yaml` 示例：
-
 ```yaml
 llm:
   provider: deepseek
-  model: deepseek-v4-flash
+  model: deepseek-v4-pro
   api_key: ${DEEPSEEK_API_KEY}
   base_url: https://api.deepseek.com
+  max_tokens: 8192
 
 agent:
-  max_steps: 20               # 开发时少一点，节省时间
-  budget_tokens: 40000
+  max_steps: 40
+  budget_tokens: 200000
+  log_dir: ./logs
+
+tools:
+  shell:
+    timeout: 30
+    max_output_tokens: 8000
+  file:
+    max_view_lines: 100
 
 context:
-  repo_map_budget: 4000
-  history_window: 10
+  repo_map_budget: 8000
+  history_window: 20
+
+observability:
+  langfuse:
+    enabled: true
+    base_url: ${LANGFUSE_BASE_URL}
+    public_key: ${LANGFUSE_PUBLIC_KEY}
+    secret_key: ${LANGFUSE_SECRET_KEY}
+    trace_content: full
+    flush_on_exit: true
+    debug: false
+```
+
+多环境配置：
+
+```bash
+forgeagent run --repo . --task "fix bug" -c config/pro.yaml
+forgeagent chat --repo . -c config/dev.yaml
 ```
 
 ---
 
-## 快速参考卡
+## 快速参考
 
 ```bash
-# 安装
-pip install -e ".[dev]"
+# 主入口
+forgeagent run --repo . --task "fix the failing tests"
+forgeagent run --repo . --mode inspect --task "inspect the project"
+forgeagent run --repo . --task-file task.txt --sandbox
+forgeagent run --repo . --mode maintain --task "update dependencies and run tests" --confirm
+forgeagent run --repo . --task "fix tests" --verify "pytest" --fail-on-unverified
 
-# 设置 Key
-export DEEPSEEK_API_KEY=sk-xxx
-
-# 验证
-python smoke_test.py
-
-# 日常使用
-cd your-project
-forgeagent chat                          # 开启对话
-forgeagent chat --model deepseek-v4-pro  # 切换模型
-
-# 一次性任务
-forgeagent run --task "fix the failing tests"
-forgeagent run --task-file task.txt
-
-# 安全选项
-forgeagent run --task "..." --confirm    # 危险命令需确认
-forgeagent run --task "..." --sandbox    # Docker 沙箱
-
-# GitHub Issue
-export GITHUB_TOKEN=ghp_xxx
-python -m entry.github_issue -r owner/repo -i 42 -l /tmp/repo
-
-# SWE-bench predictions
-python -m entry.swebench generate \
-  --split dev --limit 1 \
-  --output runs/swebench/dev_predictions.jsonl
-
-# 查看日志
+# 审计
 forgeagent log list
 forgeagent log show logs/xxx.jsonl
 
-# 对话内命令
-# /exit   退出
-# /stats  查看统计
-# /clear  清空历史
-# /help   帮助
+# 辅助交互
+forgeagent chat --repo .
+
+# 高级/实验
+python -m entry.github_issue -r owner/repo -i 42 -l /tmp/repo --no-pr
+python -m entry.swebench generate --split dev --limit 1 --output predictions.jsonl
+forgeagent eval add-trace TRACE_OR_URL
 ```

@@ -8,4 +8,6 @@ __pycache__/
 .env.*
 .python-version
 uv.lock
-docs/
+docs/*
+!docs/policy.md
+!docs/run-mode-core-changes-analysis.md

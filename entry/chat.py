@@ -11,8 +11,8 @@ history 跨轮保留，像 Claude Code 一样可以持续对话。
 - 实时打印：每条 event 写入 log 后立刻 echo，不等跑完
 
 用法：
-    agent chat --repo /path/to/repo
-    agent chat --repo . --model deepseek-chat
+    forgeagent chat --repo /path/to/repo
+    forgeagent chat --repo . --model deepseek-chat
 """
 
 from __future__ import annotations
@@ -201,15 +201,26 @@ class ChatSession:
     - repo_map 缓存（换 repo 时自动失效）
     """
 
-    def __init__(self, backend, registry, config, repo_path: str, log_dir: str, confirm_callback=None) -> None:
+    def __init__(
+        self,
+        backend,
+        registry,
+        config,
+        repo_path: str,
+        log_dir: str,
+        confirm_callback=None,
+        permission_mode: str = "fix",
+    ) -> None:
         from agent.core import Agent, AgentConfig
         from agent.telemetry import build_tracer_from_config
         from context.history import ConversationHistory
+        from policy import PolicyEngine
 
         self.repo_path = repo_path
         self.log_dir = log_dir
         self.config = config
         self._confirm_callback = confirm_callback
+        self.permission_mode = permission_mode
         self._render_state = ChatRenderState()
 
         def _thought_cb(text: str) -> None:
@@ -260,6 +271,7 @@ class ChatSession:
             thought_callback=_thought_cb,
             confirm_callback=confirm_callback,
             tracer=self.tracer,
+            policy_engine=PolicyEngine(mode=permission_mode),
         )
         self.agent = Agent(backend, registry, agent_cfg)
         self._shared_history = ConversationHistory(
