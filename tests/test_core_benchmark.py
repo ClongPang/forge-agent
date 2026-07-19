@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -10,21 +12,36 @@ from agent.core_benchmark import (
     CommandExecutionResult,
     CoreBenchmarkCaseResult,
     CoreBenchmarkRunResult,
+    all_core_cases,
     build_run_command,
     default_core_cases,
     evaluate_case_result,
+    medium_cases,
     parse_report_path,
     run_core_benchmark,
+    select_benchmark_cases,
     select_core_cases,
+    smoke_cases,
 )
 from entry.cli import cli
 
 
 def _case(case_id: str):
-    return {case.id: case for case in default_core_cases()}[case_id]
+    return {case.id: case for case in all_core_cases()}[case_id]
 
 
-def _write_report(path: Path, *, mode: str, changed_files: list[str]) -> None:
+def _write_report(
+    path: Path,
+    *,
+    mode: str,
+    changed_files: list[str],
+    patch_chars: int | None = None,
+) -> None:
+    resolved_patch_chars = (
+        patch_chars
+        if patch_chars is not None
+        else (42 if changed_files else 0)
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps({
@@ -33,7 +50,7 @@ def _write_report(path: Path, *, mode: str, changed_files: list[str]) -> None:
             "result": {
                 "status": "success",
                 "has_patch": bool(changed_files),
-                "patch_chars": 42 if changed_files else 0,
+                "patch_chars": resolved_patch_chars,
             },
             "verification": {
                 "requested": True,
@@ -56,6 +73,53 @@ def test_select_core_cases_accepts_comma_separated_ids():
     )
 
     assert [case.id for case in selected] == ["verification_guard"]
+
+
+def test_suite_definitions_keep_smoke_default_and_medium_separate():
+    assert len(smoke_cases()) == 5
+    assert len(default_core_cases()) == 5
+    assert len(medium_cases()) == 8
+    assert len(all_core_cases()) == 13
+    assert all(case.suite == "smoke" for case in smoke_cases())
+    assert all(case.suite == "medium" for case in medium_cases())
+
+
+def test_explicit_case_ids_are_selected_across_suites():
+    selected = select_benchmark_cases(case_ids=("no_test_cheating",))
+
+    assert [case.id for case in selected] == ["no_test_cheating"]
+    assert selected[0].suite == "medium"
+
+
+def test_medium_suite_selection():
+    selected = select_benchmark_cases(suite="medium", limit=2)
+
+    assert [case.suite for case in selected] == ["medium", "medium"]
+    assert [case.id for case in selected] == [
+        "no_test_cheating",
+        "existing_tests_must_stay_green",
+    ]
+
+
+def test_medium_case_repos_have_failing_pytest_oracles(tmp_path):
+    for case in medium_cases():
+        repo = tmp_path / case.id
+        repo.mkdir()
+        case.setup(repo)
+
+        proc = subprocess.run(
+            [sys.executable, "-m", "pytest", "-q"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        output = proc.stdout + proc.stderr
+
+        assert proc.returncode == 1, f"{case.id} did not fail as expected:\n{output}"
+        assert "failed" in output
+        assert "SyntaxError" not in output
+        assert "ModuleNotFoundError" not in output
 
 
 def test_build_run_command_passes_case_controls(tmp_path):
@@ -118,10 +182,13 @@ def test_run_core_benchmark_uses_fake_runner_and_writes_summary(tmp_path):
 
     assert result.success is True
     assert invoked_commands[0][:3] == [".venv/bin/python", "-m", "entry.cli"]
+    assert result.suite == "custom"
     assert result.total == 1
     assert result.cases[0].changed_files == ["calc.py"]
+    assert result.cases[0].suite == "smoke"
     summary = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
     assert summary["passed"] == 1
+    assert summary["suite"] == "custom"
     assert summary["cases"][0]["case_id"] == "basic_python_fix"
 
 
@@ -158,19 +225,60 @@ def test_evaluate_case_result_detects_forbidden_test_edit(tmp_path):
     assert any("expected changed files exactly" in item for item in result.failures)
 
 
+def test_evaluate_case_result_enforces_patch_size_limit(tmp_path):
+    case = _case("minimal_patch_required")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    case.setup(repo)
+    (repo / "ranking.py").write_text(
+        "def rank_players(players):\n    return []\n",
+        encoding="utf-8",
+    )
+    report_path = tmp_path / "report.json"
+    _write_report(
+        report_path,
+        mode="fix",
+        changed_files=["ranking.py"],
+        patch_chars=5000,
+    )
+
+    result = evaluate_case_result(
+        case=case,
+        process=CommandExecutionResult(
+            returncode=0,
+            stdout=f"Report  : {report_path}\n",
+            stderr="",
+        ),
+        repo_path=repo,
+        project_root=tmp_path,
+        duration_seconds=0.1,
+    )
+
+    assert result.passed is False
+    assert any("patch_chars <=" in item for item in result.failures)
+
+
 def test_cli_eval_run_core_list_cases():
     runner = CliRunner()
 
-    result = runner.invoke(cli, ["eval", "run-core", "--list-cases"], obj={})
+    result = runner.invoke(cli, [
+        "eval",
+        "run-core",
+        "--suite",
+        "all",
+        "--list-cases",
+    ], obj={})
 
     assert result.exit_code == 0
     assert "basic_python_fix" in result.output
+    assert "no_test_cheating" in result.output
     assert "verification_guard" in result.output
 
 
 def test_cli_eval_run_core_calls_helper(tmp_path):
     helper_result = CoreBenchmarkRunResult(
         run_id="run-1",
+        suite="smoke",
         work_dir=str(tmp_path / "work"),
         summary_path=str(tmp_path / "summary.json"),
         total=1,
@@ -180,6 +288,8 @@ def test_cli_eval_run_core_calls_helper(tmp_path):
             CoreBenchmarkCaseResult(
                 case_id="basic_python_fix",
                 name="basic Python bug fix",
+                suite="smoke",
+                tags=["fix"],
                 passed=True,
                 failures=[],
                 exit_code=0,
@@ -206,6 +316,8 @@ def test_cli_eval_run_core_calls_helper(tmp_path):
             "config/eval.yaml",
             "eval",
             "run-core",
+            "--suite",
+            "medium",
             "--case",
             "basic_python_fix",
             "--work-dir",
@@ -224,6 +336,7 @@ def test_cli_eval_run_core_calls_helper(tmp_path):
     assert "Passed : 1/1" in result.output
     mock_run.assert_called_once()
     _, kwargs = mock_run.call_args
+    assert kwargs["suite"] == "medium"
     assert kwargs["config_path"] == "config/eval.yaml"
     assert kwargs["case_ids"] == ("basic_python_fix",)
     assert kwargs["provider"] == "mock"

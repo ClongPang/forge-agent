@@ -22,6 +22,8 @@ cd /Users/pclong/projects_dev/forge-agent
 
 ```bash
 .venv/bin/python -m entry.cli eval run-core --list-cases
+.venv/bin/python -m entry.cli eval run-core --suite medium
+.venv/bin/python -m entry.cli eval run-core --suite all --list-cases
 .venv/bin/python -m entry.cli eval run-core --case basic_python_fix
 .venv/bin/python -m entry.cli eval run-core \
   --case basic_python_fix \
@@ -32,6 +34,8 @@ cd /Users/pclong/projects_dev/forge-agent
 该命令会自动创建临时样例仓库、调用现有 `run` 命令、读取每次运行的
 `report.json`，并输出一份 benchmark summary JSON。下面的手动步骤仍然
 适合排查某个 case 的具体失败原因。
+
+默认运行 `smoke` suite；`medium` suite 用于更真实的本地仓库开发任务。
 
 ## 0. 评测原则
 

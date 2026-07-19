@@ -160,14 +160,15 @@ forgeagent eval add-trace TRACE_OR_URL --dataset forge-agent/regression
 
 ```bash
 forgeagent eval run-core
-forgeagent eval run-core --case basic_python_fix --case inspect_readonly
-forgeagent eval run-core --list-cases
+forgeagent eval run-core --suite medium
+forgeagent eval run-core --suite all --list-cases
 ```
 
 该入口会创建临时样例仓库，调用现有 `run` 命令，并根据 `report.json`
 检查退出码、verification、permission mode、changed files 和 artifact。
 
-内置 case 可以单独启动：
+默认 `smoke` suite 包含快速 runner 回归 case；`medium` suite 包含更接近
+日常开发任务的本地仓库 case。case 可以单独启动：
 
 ```bash
 forgeagent eval run-core --case basic_python_fix
@@ -175,6 +176,14 @@ forgeagent eval run-core --case multi_file_python_fix
 forgeagent eval run-core --case inspect_readonly
 forgeagent eval run-core --case fail_on_unverified
 forgeagent eval run-core --case verification_guard
+forgeagent eval run-core --case no_test_cheating
+forgeagent eval run-core --case existing_tests_must_stay_green
+forgeagent eval run-core --case multi_file_indirect_call
+forgeagent eval run-core --case config_override_priority
+forgeagent eval run-core --case cli_exit_code_bug
+forgeagent eval run-core --case path_normalization_security
+forgeagent eval run-core --case parser_edge_cases
+forgeagent eval run-core --case minimal_patch_required
 ```
 
 ---

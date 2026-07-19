@@ -653,6 +653,13 @@ def eval_cmd() -> None:
 
 @eval_cmd.command("run-core")
 @click.option(
+    "--suite",
+    default="smoke",
+    show_default=True,
+    type=click.Choice(["smoke", "medium", "all"]),
+    help="Built-in core benchmark suite to run when --case is not provided.",
+)
+@click.option(
     "--case",
     "case_ids",
     multiple=True,
@@ -693,6 +700,7 @@ def eval_cmd() -> None:
 @click.pass_context
 def eval_run_core(
     ctx: click.Context,
+    suite: str,
     case_ids: tuple[str, ...],
     limit: int | None,
     work_dir: str,
@@ -706,12 +714,12 @@ def eval_run_core(
     list_cases: bool,
 ) -> None:
     """Run the local core benchmark suite against `run` mode."""
-    from agent.core_benchmark import default_core_cases, run_core_benchmark
+    from agent.core_benchmark import core_cases_for_suite, run_core_benchmark
 
     if list_cases:
-        click.echo(bold("Core benchmark cases"))
-        for case in default_core_cases():
-            click.echo(f"  {case.id:<24} {case.mode:<8} {case.name}")
+        click.echo(bold(f"Core benchmark cases ({suite})"))
+        for case in core_cases_for_suite(suite):
+            click.echo(f"  {case.id:<32} {case.suite:<7} {case.mode:<8} {case.name}")
         return
 
     click.echo(bold("\nForge Agent Core Benchmark"))
@@ -719,13 +727,14 @@ def eval_run_core(
     if case_ids:
         click.echo(f"  Cases    : {', '.join(case_ids)}")
     elif limit is not None:
-        click.echo(f"  Cases    : first {limit}")
+        click.echo(f"  Cases    : first {limit} from {suite}")
     else:
-        click.echo("  Cases    : built-in suite")
+        click.echo(f"  Cases    : {suite} suite")
     click.echo()
 
     try:
         result = run_core_benchmark(
+            suite=suite,
             work_dir=work_dir,
             output_path=output,
             case_ids=case_ids,
@@ -749,6 +758,7 @@ def eval_run_core(
         label = green("PASS") if case_result.passed else red("FAIL")
         click.echo(
             f"[{label}] {case_result.case_id} "
+            f"suite={case_result.suite} "
             f"exit={case_result.exit_code} "
             f"verify={case_result.verification_status or '-'} "
             f"changed={case_result.changed_files}"

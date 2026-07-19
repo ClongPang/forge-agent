@@ -26,6 +26,7 @@ from typing import Any, Callable, Sequence
 
 DEFAULT_CORE_WORK_DIR = "runs/core-eval"
 DEFAULT_CASE_TIMEOUT = 900
+CORE_BENCHMARK_SUITES = ("smoke", "medium", "all")
 
 _REPORT_LINE_RE = re.compile(r"^Report\s*:\s*(.+?)\s*$", re.MULTILINE)
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
@@ -44,8 +45,10 @@ class CoreBenchmarkExpectation:
     has_patch: bool | None = None
     repo_clean: bool | None = None
     changed_files_exact: tuple[str, ...] | None = None
+    changed_files_allowed: tuple[str, ...] = ()
     changed_files_include: tuple[str, ...] = ()
     changed_files_exclude: tuple[str, ...] = ()
+    patch_chars_max: int | None = None
 
 
 @dataclass(frozen=True)
@@ -57,6 +60,7 @@ class CoreBenchmarkCase:
     task: str
     mode: str
     setup: Callable[[Path], None]
+    suite: str = "smoke"
     verify_commands: tuple[str, ...] = ()
     fail_on_unverified: bool = True
     expectation: CoreBenchmarkExpectation = CoreBenchmarkExpectation()
@@ -67,6 +71,7 @@ class CoreBenchmarkCase:
             "id": self.id,
             "name": self.name,
             "mode": self.mode,
+            "suite": self.suite,
             "verify_commands": list(self.verify_commands),
             "fail_on_unverified": self.fail_on_unverified,
             "tags": list(self.tags),
@@ -89,6 +94,8 @@ class CoreBenchmarkCaseResult:
 
     case_id: str
     name: str
+    suite: str
+    tags: list[str]
     passed: bool
     failures: list[str]
     exit_code: int
@@ -114,6 +121,7 @@ class CoreBenchmarkRunResult:
     """Summary for a completed core benchmark run."""
 
     run_id: str
+    suite: str
     work_dir: str
     summary_path: str
     total: int
@@ -130,6 +138,7 @@ class CoreBenchmarkRunResult:
             "schema_version": 1,
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "run_id": self.run_id,
+            "suite": self.suite,
             "work_dir": self.work_dir,
             "summary_path": self.summary_path,
             "total": self.total,
@@ -145,8 +154,8 @@ CommandRunner = Callable[
 ]
 
 
-def default_core_cases() -> list[CoreBenchmarkCase]:
-    """Return the built-in local core benchmark suite."""
+def smoke_cases() -> list[CoreBenchmarkCase]:
+    """Return the fast run-mode smoke suite."""
     return [
         CoreBenchmarkCase(
             id="basic_python_fix",
@@ -247,6 +256,225 @@ def default_core_cases() -> list[CoreBenchmarkCase]:
     ]
 
 
+def medium_cases() -> list[CoreBenchmarkCase]:
+    """Return medium-difficulty local repositories for agent iteration."""
+    return [
+        CoreBenchmarkCase(
+            id="no_test_cheating",
+            name="source fix without test cheating",
+            mode="fix",
+            suite="medium",
+            setup=_setup_no_test_cheating,
+            task=(
+                "Fix the failing pytest tests by correcting the implementation. "
+                "Do not edit tests and keep the public API unchanged."
+            ),
+            verify_commands=("python -m pytest -q",),
+            expectation=CoreBenchmarkExpectation(
+                exit_code=0,
+                result_status="success",
+                verification_passed=True,
+                verification_status="passed",
+                has_patch=True,
+                changed_files_exact=("calculator.py",),
+            ),
+            tags=("medium", "no-test-edit", "verification"),
+        ),
+        CoreBenchmarkCase(
+            id="existing_tests_must_stay_green",
+            name="fix regression without breaking existing behavior",
+            mode="fix",
+            suite="medium",
+            setup=_setup_existing_tests_must_stay_green,
+            task=(
+                "Fix the slugify regression while preserving all existing "
+                "behavior. Do not edit tests."
+            ),
+            verify_commands=("python -m pytest -q",),
+            expectation=CoreBenchmarkExpectation(
+                exit_code=0,
+                result_status="success",
+                verification_passed=True,
+                verification_status="passed",
+                has_patch=True,
+                changed_files_exact=("slugify.py",),
+            ),
+            tags=("medium", "regression", "verification"),
+        ),
+        CoreBenchmarkCase(
+            id="multi_file_indirect_call",
+            name="multi-file indirect call bug",
+            mode="fix",
+            suite="medium",
+            setup=_setup_multi_file_indirect_call,
+            task=(
+                "Fix the invoice rendering bug. Trace the call chain and make "
+                "the minimal source change. Do not edit tests."
+            ),
+            verify_commands=("python -m pytest -q",),
+            expectation=CoreBenchmarkExpectation(
+                exit_code=0,
+                result_status="success",
+                verification_passed=True,
+                verification_status="passed",
+                has_patch=True,
+                changed_files_exact=("app/formatter.py",),
+            ),
+            tags=("medium", "context", "multi-file"),
+        ),
+        CoreBenchmarkCase(
+            id="config_override_priority",
+            name="configuration override priority",
+            mode="fix",
+            suite="medium",
+            setup=_setup_config_override_priority,
+            task=(
+                "Fix the configuration resolution priority so CLI overrides win "
+                "over environment values, which win over file config and defaults. "
+                "Do not edit tests."
+            ),
+            verify_commands=("python -m pytest -q",),
+            expectation=CoreBenchmarkExpectation(
+                exit_code=0,
+                result_status="success",
+                verification_passed=True,
+                verification_status="passed",
+                has_patch=True,
+                changed_files_exact=("settings/loader.py",),
+            ),
+            tags=("medium", "config", "priority"),
+        ),
+        CoreBenchmarkCase(
+            id="cli_exit_code_bug",
+            name="CLI failure exit code",
+            mode="fix",
+            suite="medium",
+            setup=_setup_cli_exit_code_bug,
+            task=(
+                "Fix the CLI failure behavior so the failing command reports "
+                "the expected non-zero exit code and stderr. Do not edit tests."
+            ),
+            verify_commands=("python -m pytest -q",),
+            expectation=CoreBenchmarkExpectation(
+                exit_code=0,
+                result_status="success",
+                verification_passed=True,
+                verification_status="passed",
+                has_patch=True,
+                changed_files_exact=("miniapp/cli.py",),
+            ),
+            tags=("medium", "cli", "exit-code"),
+        ),
+        CoreBenchmarkCase(
+            id="path_normalization_security",
+            name="toy path normalization security boundary",
+            mode="fix",
+            suite="medium",
+            setup=_setup_path_normalization_security,
+            task=(
+                "Fix the toy safe path helper so it rejects parent traversal "
+                "and absolute paths outside the root while allowing root-local "
+                "paths. Do not edit tests."
+            ),
+            verify_commands=("python -m pytest -q",),
+            expectation=CoreBenchmarkExpectation(
+                exit_code=0,
+                result_status="success",
+                verification_passed=True,
+                verification_status="passed",
+                has_patch=True,
+                changed_files_exact=("toyguard/safe_path.py",),
+            ),
+            tags=("medium", "security", "paths"),
+        ),
+        CoreBenchmarkCase(
+            id="parser_edge_cases",
+            name="key-value parser edge cases",
+            mode="fix",
+            suite="medium",
+            setup=_setup_parser_edge_cases,
+            task=(
+                "Fix the key-value parser edge cases. It should skip blank "
+                "lines and comment lines, trim keys and values, and preserve "
+                "empty values. Do not edit tests."
+            ),
+            verify_commands=("python -m pytest -q",),
+            expectation=CoreBenchmarkExpectation(
+                exit_code=0,
+                result_status="success",
+                verification_passed=True,
+                verification_status="passed",
+                has_patch=True,
+                changed_files_exact=("kvparser/kv.py",),
+            ),
+            tags=("medium", "parser", "edge-cases"),
+        ),
+        CoreBenchmarkCase(
+            id="minimal_patch_required",
+            name="minimal ranking tie-breaker patch",
+            mode="fix",
+            suite="medium",
+            setup=_setup_minimal_patch_required,
+            task=(
+                "Fix the ranking tie-breaker bug with the smallest reasonable "
+                "implementation change. Do not rewrite the module and do not "
+                "edit tests."
+            ),
+            verify_commands=("python -m pytest -q",),
+            expectation=CoreBenchmarkExpectation(
+                exit_code=0,
+                result_status="success",
+                verification_passed=True,
+                verification_status="passed",
+                has_patch=True,
+                changed_files_exact=("ranking.py",),
+                patch_chars_max=1600,
+            ),
+            tags=("medium", "minimal-patch", "ranking"),
+        ),
+    ]
+
+
+def all_core_cases() -> list[CoreBenchmarkCase]:
+    """Return every built-in local core benchmark case."""
+    return smoke_cases() + medium_cases()
+
+
+def default_core_cases() -> list[CoreBenchmarkCase]:
+    """Return the default local core benchmark suite."""
+    return smoke_cases()
+
+
+def core_cases_for_suite(suite: str) -> list[CoreBenchmarkCase]:
+    """Return cases for a named suite."""
+    normalized = normalize_core_suite(suite)
+    if normalized == "smoke":
+        return smoke_cases()
+    if normalized == "medium":
+        return medium_cases()
+    return all_core_cases()
+
+
+def normalize_core_suite(suite: str) -> str:
+    """Validate and normalize a core benchmark suite name."""
+    normalized = (suite or "smoke").strip().lower()
+    if normalized not in CORE_BENCHMARK_SUITES:
+        choices = ", ".join(CORE_BENCHMARK_SUITES)
+        raise ValueError(f"Unknown core benchmark suite {suite!r}; choose one of: {choices}")
+    return normalized
+
+
+def select_benchmark_cases(
+    *,
+    suite: str = "smoke",
+    case_ids: Sequence[str] | None = None,
+    limit: int | None = None,
+) -> list[CoreBenchmarkCase]:
+    """Select cases for a suite, or from all suites when ids are explicit."""
+    base = all_core_cases() if _parse_case_ids(case_ids) else core_cases_for_suite(suite)
+    return select_core_cases(base, case_ids=case_ids, limit=limit)
+
+
 def select_core_cases(
     cases: Sequence[CoreBenchmarkCase],
     case_ids: Sequence[str] | None = None,
@@ -273,6 +501,7 @@ def select_core_cases(
 
 def run_core_benchmark(
     *,
+    suite: str = "smoke",
     work_dir: str | Path = DEFAULT_CORE_WORK_DIR,
     output_path: str | Path | None = None,
     case_ids: Sequence[str] | None = None,
@@ -289,6 +518,7 @@ def run_core_benchmark(
     command_runner: CommandRunner | None = None,
 ) -> CoreBenchmarkRunResult:
     """Run the local core benchmark suite and write a JSON summary."""
+    normalized_suite = normalize_core_suite(suite)
     if verify_timeout <= 0:
         raise ValueError("--verify-timeout must be positive")
     if case_timeout <= 0:
@@ -309,7 +539,12 @@ def run_core_benchmark(
     py = str(python_executable or sys.executable)
     runner = command_runner or _run_subprocess
     env = _benchmark_env(py)
-    selected = select_core_cases(default_core_cases(), case_ids=case_ids, limit=limit)
+    selected = select_benchmark_cases(
+        suite=normalized_suite,
+        case_ids=case_ids,
+        limit=limit,
+    )
+    result_suite = "custom" if _parse_case_ids(case_ids) else normalized_suite
 
     results: list[CoreBenchmarkCaseResult] = []
     for case in selected:
@@ -341,6 +576,7 @@ def run_core_benchmark(
     passed_count = sum(1 for result in results if result.passed)
     run_result = CoreBenchmarkRunResult(
         run_id=run_id,
+        suite=result_suite,
         work_dir=str(run_dir),
         summary_path=str(summary_path),
         total=len(results),
@@ -424,6 +660,8 @@ def evaluate_case_result(
     return CoreBenchmarkCaseResult(
         case_id=case.id,
         name=case.name,
+        suite=case.suite,
+        tags=list(case.tags),
         passed=not failures,
         failures=failures,
         exit_code=process.returncode,
@@ -551,6 +789,13 @@ def _check_expectations(
             f"expected result.has_patch {expectation.has_patch!r}, "
             f"got {result.get('has_patch')!r}"
         )
+    if expectation.patch_chars_max is not None:
+        patch_chars = int(result.get("patch_chars") or 0)
+        if patch_chars > expectation.patch_chars_max:
+            failures.append(
+                f"expected result.patch_chars <= {expectation.patch_chars_max}, "
+                f"got {patch_chars}"
+            )
 
     actual = tuple(actual_changed_files)
     if expectation.repo_clean is not None:
@@ -566,6 +811,13 @@ def _check_expectations(
             failures.append(
                 f"expected changed files exactly {list(expected)}, "
                 f"got {actual_changed_files}"
+            )
+    if expectation.changed_files_allowed:
+        allowed = set(expectation.changed_files_allowed)
+        unexpected = [path for path in actual_changed_files if path not in allowed]
+        if unexpected:
+            failures.append(
+                f"changed files outside allowed set {sorted(allowed)}: {unexpected}"
             )
     for path in expectation.changed_files_include:
         if path not in actual_changed_files:
@@ -662,6 +914,308 @@ def _setup_passing_calculator(repo_path: Path) -> None:
         },
     )
     _commit_all(repo_path, "Initial passing calculator")
+
+
+def _setup_no_test_cheating(repo_path: Path) -> None:
+    _write_files(
+        repo_path,
+        {
+            ".gitignore": _python_gitignore(),
+            "calculator.py": (
+                "def divide(a, b):\n"
+                "    if b == 0:\n"
+                "        return 0\n"
+                "    return a / b\n"
+            ),
+            "tests/test_calculator.py": (
+                "import pytest\n\n"
+                "from calculator import divide\n\n\n"
+                "def test_divides_numbers():\n"
+                "    assert divide(8, 2) == 4\n\n\n"
+                "def test_divide_by_zero_raises():\n"
+                "    with pytest.raises(ZeroDivisionError):\n"
+                "        divide(8, 0)\n"
+            ),
+        },
+    )
+    _commit_all(repo_path, "Initial broken division behavior")
+
+
+def _setup_existing_tests_must_stay_green(repo_path: Path) -> None:
+    _write_files(
+        repo_path,
+        {
+            ".gitignore": _python_gitignore(),
+            "slugify.py": (
+                "def slugify(value):\n"
+                "    value = value.strip().lower()\n"
+                "    if not value:\n"
+                "        return \"\"\n"
+                "    return \"-\".join(value.split())\n"
+            ),
+            "tests/test_slugify_existing.py": (
+                "from slugify import slugify\n\n\n"
+                "def test_lowercases_words():\n"
+                "    assert slugify(\"Hello World\") == \"hello-world\"\n\n\n"
+                "def test_collapses_extra_spaces():\n"
+                "    assert slugify(\"  A   B  \") == \"a-b\"\n\n\n"
+                "def test_empty_string_remains_empty():\n"
+                "    assert slugify(\"   \") == \"\"\n"
+            ),
+            "tests/test_slugify_regression.py": (
+                "from slugify import slugify\n\n\n"
+                "def test_removes_punctuation():\n"
+                "    assert slugify(\"Hello, World!\") == \"hello-world\"\n\n\n"
+                "def test_collapses_punctuation_between_words():\n"
+                "    assert slugify(\"Tasks & Notes\") == \"tasks-notes\"\n"
+            ),
+        },
+    )
+    _commit_all(repo_path, "Initial slugify punctuation regression")
+
+
+def _setup_multi_file_indirect_call(repo_path: Path) -> None:
+    _write_files(
+        repo_path,
+        {
+            ".gitignore": _python_gitignore(),
+            "app/__init__.py": "",
+            "app/api.py": (
+                "from app.service import invoice_summary\n\n\n"
+                "def render_invoice(customer, cents):\n"
+                "    return invoice_summary(customer, cents)\n"
+            ),
+            "app/service.py": (
+                "from app.formatter import format_money\n\n\n"
+                "def invoice_summary(customer, cents):\n"
+                "    return f\"{customer}: {format_money(cents)}\"\n"
+            ),
+            "app/formatter.py": (
+                "def format_money(cents):\n"
+                "    dollars = cents / 10\n"
+                "    return f\"${dollars:.2f}\"\n"
+            ),
+            "app/audit.py": (
+                "def audit_event(name, payload):\n"
+                "    return {\"name\": name, \"payload\": payload}\n"
+            ),
+            "tests/test_invoice.py": (
+                "from app.api import render_invoice\n\n\n"
+                "def test_invoice_uses_cents():\n"
+                "    assert render_invoice(\"Ada\", 1234) == \"Ada: $12.34\"\n\n\n"
+                "def test_invoice_rounds_to_two_decimals():\n"
+                "    assert render_invoice(\"Grace\", 999) == \"Grace: $9.99\"\n"
+            ),
+        },
+    )
+    _commit_all(repo_path, "Initial broken invoice formatting")
+
+
+def _setup_config_override_priority(repo_path: Path) -> None:
+    _write_files(
+        repo_path,
+        {
+            ".gitignore": _python_gitignore(),
+            "settings/__init__.py": "",
+            "settings/loader.py": (
+                "def resolve_setting(name, *, cli_overrides=None, env=None, "
+                "file_config=None, defaults=None):\n"
+                "    cli_overrides = cli_overrides or {}\n"
+                "    env = env or {}\n"
+                "    file_config = file_config or {}\n"
+                "    defaults = defaults or {}\n"
+                "    if name in env:\n"
+                "        return env[name]\n"
+                "    if name in cli_overrides:\n"
+                "        return cli_overrides[name]\n"
+                "    if name in file_config:\n"
+                "        return file_config[name]\n"
+                "    return defaults.get(name)\n"
+            ),
+            "tests/test_loader.py": (
+                "from settings.loader import resolve_setting\n\n\n"
+                "def test_cli_override_wins_over_env():\n"
+                "    assert resolve_setting(\n"
+                "        \"model\",\n"
+                "        cli_overrides={\"model\": \"cli-model\"},\n"
+                "        env={\"model\": \"env-model\"},\n"
+                "        file_config={\"model\": \"file-model\"},\n"
+                "        defaults={\"model\": \"default-model\"},\n"
+                "    ) == \"cli-model\"\n\n\n"
+                "def test_env_wins_over_file_config():\n"
+                "    assert resolve_setting(\n"
+                "        \"timeout\",\n"
+                "        env={\"timeout\": 30},\n"
+                "        file_config={\"timeout\": 10},\n"
+                "        defaults={\"timeout\": 5},\n"
+                "    ) == 30\n\n\n"
+                "def test_default_used_when_no_override_exists():\n"
+                "    assert resolve_setting(\"retries\", defaults={\"retries\": 2}) == 2\n"
+            ),
+        },
+    )
+    _commit_all(repo_path, "Initial config priority bug")
+
+
+def _setup_cli_exit_code_bug(repo_path: Path) -> None:
+    _write_files(
+        repo_path,
+        {
+            ".gitignore": _python_gitignore(),
+            "miniapp/__init__.py": "",
+            "miniapp/cli.py": (
+                "from __future__ import annotations\n\n"
+                "import argparse\n"
+                "import sys\n\n\n"
+                "def main(argv=None):\n"
+                "    parser = argparse.ArgumentParser(prog=\"miniapp\")\n"
+                "    parser.add_argument(\"--fail\", action=\"store_true\")\n"
+                "    args = parser.parse_args(argv)\n"
+                "    if args.fail:\n"
+                "        print(\"failed\", file=sys.stderr)\n"
+                "        return 0\n"
+                "    print(\"ok\")\n"
+                "    return 0\n\n\n"
+                "if __name__ == \"__main__\":\n"
+                "    raise SystemExit(main())\n"
+            ),
+            "tests/test_cli.py": (
+                "import subprocess\n"
+                "import sys\n\n\n"
+                "def run_cli(*args):\n"
+                "    return subprocess.run(\n"
+                "        [sys.executable, \"-m\", \"miniapp.cli\", *args],\n"
+                "        capture_output=True,\n"
+                "        text=True,\n"
+                "    )\n\n\n"
+                "def test_success_exit_code_and_stdout():\n"
+                "    proc = run_cli()\n"
+                "    assert proc.returncode == 0\n"
+                "    assert proc.stdout.strip() == \"ok\"\n\n\n"
+                "def test_fail_exit_code_and_stderr():\n"
+                "    proc = run_cli(\"--fail\")\n"
+                "    assert proc.returncode == 2\n"
+                "    assert \"failed\" in proc.stderr\n"
+            ),
+        },
+    )
+    _commit_all(repo_path, "Initial CLI exit code bug")
+
+
+def _setup_path_normalization_security(repo_path: Path) -> None:
+    _write_files(
+        repo_path,
+        {
+            ".gitignore": _python_gitignore(),
+            "toyguard/__init__.py": "",
+            "toyguard/safe_path.py": (
+                "from pathlib import Path\n\n\n"
+                "def safe_join(root, user_path):\n"
+                "    root_path = Path(root).resolve()\n"
+                "    return root_path / user_path\n"
+            ),
+            "tests/test_safe_path.py": (
+                "import pytest\n\n"
+                "from toyguard.safe_path import safe_join\n\n\n"
+                "def test_allows_root_local_paths(tmp_path):\n"
+                "    assert safe_join(tmp_path, \"logs/out.txt\") == (\n"
+                "        tmp_path / \"logs\" / \"out.txt\"\n"
+                "    ).resolve()\n\n\n"
+                "def test_rejects_parent_traversal(tmp_path):\n"
+                "    with pytest.raises(ValueError):\n"
+                "        safe_join(tmp_path, \"../secret.txt\")\n\n\n"
+                "def test_rejects_absolute_path_outside_root(tmp_path):\n"
+                "    outside = tmp_path.parent / \"secret.txt\"\n"
+                "    with pytest.raises(ValueError):\n"
+                "        safe_join(tmp_path, str(outside))\n"
+            ),
+        },
+    )
+    _commit_all(repo_path, "Initial toy path guard bug")
+
+
+def _setup_parser_edge_cases(repo_path: Path) -> None:
+    _write_files(
+        repo_path,
+        {
+            ".gitignore": _python_gitignore(),
+            "kvparser/__init__.py": "",
+            "kvparser/kv.py": (
+                "def parse_kv(text):\n"
+                "    result = {}\n"
+                "    for line in text.splitlines():\n"
+                "        key, value = line.split(\"=\", 1)\n"
+                "        result[key] = value\n"
+                "    return result\n"
+            ),
+            "tests/test_kv.py": (
+                "from kvparser.kv import parse_kv\n\n\n"
+                "def test_parses_basic_pairs():\n"
+                "    assert parse_kv(\"name=Alice\\ncity=Paris\") == {\n"
+                "        \"name\": \"Alice\",\n"
+                "        \"city\": \"Paris\",\n"
+                "    }\n\n\n"
+                "def test_ignores_blank_lines_and_comment_lines():\n"
+                "    assert parse_kv(\"\\n# comment\\nname=Alice\\n\") == {\n"
+                "        \"name\": \"Alice\",\n"
+                "    }\n\n\n"
+                "def test_trims_whitespace_and_preserves_empty_value():\n"
+                "    assert parse_kv(\" enabled = true \\n empty = \") == {\n"
+                "        \"enabled\": \"true\",\n"
+                "        \"empty\": \"\",\n"
+                "    }\n"
+            ),
+        },
+    )
+    _commit_all(repo_path, "Initial key-value parser edge case bug")
+
+
+def _setup_minimal_patch_required(repo_path: Path) -> None:
+    _write_files(
+        repo_path,
+        {
+            ".gitignore": _python_gitignore(),
+            "ranking.py": (
+                "def player_label(player):\n"
+                "    return f\"{player['name']} ({player['score']})\"\n\n\n"
+                "def rank_players(players):\n"
+                "    return sorted(\n"
+                "        players,\n"
+                "        key=lambda player: (\n"
+                "            -player[\"score\"],\n"
+                "            player[\"wins\"],\n"
+                "            player[\"name\"],\n"
+                "        ),\n"
+                "    )\n"
+            ),
+            "tests/test_ranking.py": (
+                "from ranking import player_label, rank_players\n\n\n"
+                "def test_high_scores_rank_first():\n"
+                "    players = [\n"
+                "        {\"name\": \"Linus\", \"score\": 9, \"wins\": 3},\n"
+                "        {\"name\": \"Ada\", \"score\": 10, \"wins\": 1},\n"
+                "    ]\n"
+                "    assert [p[\"name\"] for p in rank_players(players)] == [\n"
+                "        \"Ada\",\n"
+                "        \"Linus\",\n"
+                "    ]\n\n\n"
+                "def test_ties_use_wins_descending_then_name():\n"
+                "    players = [\n"
+                "        {\"name\": \"Linus\", \"score\": 10, \"wins\": 1},\n"
+                "        {\"name\": \"Grace\", \"score\": 10, \"wins\": 5},\n"
+                "        {\"name\": \"Ada\", \"score\": 10, \"wins\": 5},\n"
+                "    ]\n"
+                "    assert [p[\"name\"] for p in rank_players(players)] == [\n"
+                "        \"Ada\",\n"
+                "        \"Grace\",\n"
+                "        \"Linus\",\n"
+                "    ]\n\n\n"
+                "def test_player_label_is_unchanged():\n"
+                "    assert player_label({\"name\": \"Ada\", \"score\": 10}) == \"Ada (10)\"\n"
+            ),
+        },
+    )
+    _commit_all(repo_path, "Initial ranking tie-breaker bug")
 
 
 def _python_gitignore() -> str:

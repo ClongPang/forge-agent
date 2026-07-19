@@ -491,7 +491,8 @@ python -m entry.github_issue \
 
 ```bash
 forgeagent eval run-core
-forgeagent eval run-core --list-cases
+forgeagent eval run-core --suite medium
+forgeagent eval run-core --suite all --list-cases
 forgeagent eval run-core \
   --case basic_python_fix \
   --case inspect_readonly \
@@ -507,10 +508,12 @@ forgeagent eval run-core \
 - 是否产生预期 patch
 - 实际 changed files 是否符合预期
 
-默认内置 case 覆盖基础修复、多文件定位、inspect 只读、
+默认 `smoke` suite 覆盖基础修复、多文件定位、inspect 只读、
 `--fail-on-unverified` 退出码，以及 verification 命令安全边界。
+`medium` suite 覆盖禁止改测试、保留既有行为、间接调用链、配置优先级、
+CLI 退出码、路径安全边界、parser 边界输入和最小 patch 约束。
 
-单独启动每个内置 case：
+单独启动 smoke case：
 
 ```bash
 forgeagent eval run-core --case basic_python_fix
@@ -518,6 +521,19 @@ forgeagent eval run-core --case multi_file_python_fix
 forgeagent eval run-core --case inspect_readonly
 forgeagent eval run-core --case fail_on_unverified
 forgeagent eval run-core --case verification_guard
+```
+
+单独启动 medium case：
+
+```bash
+forgeagent eval run-core --case no_test_cheating
+forgeagent eval run-core --case existing_tests_must_stay_green
+forgeagent eval run-core --case multi_file_indirect_call
+forgeagent eval run-core --case config_override_priority
+forgeagent eval run-core --case cli_exit_code_bug
+forgeagent eval run-core --case path_normalization_security
+forgeagent eval run-core --case parser_edge_cases
+forgeagent eval run-core --case minimal_patch_required
 ```
 
 使用源码入口等价写法：
@@ -705,6 +721,7 @@ forgeagent chat --repo .
 
 # 高级/实验
 forgeagent eval run-core
+forgeagent eval run-core --suite medium
 forgeagent eval run-core --case basic_python_fix --output runs/core-eval/summary.json
 python -m entry.github_issue -r owner/repo -i 42 -l /tmp/repo --no-pr
 python -m entry.swebench generate --split dev --limit 1 --output predictions.jsonl
