@@ -299,7 +299,6 @@ def run_swebench_instance(
         budget_tokens=config.agent.budget_tokens,
         history_max_messages=config.context.history_window * 2,
         stream=stream,
-        confirm_dangerous=auto_confirm_tools,
         confirm_callback=confirm_cb,
         tracer=tracer,
     )
@@ -429,9 +428,9 @@ def build_benchmark_registry(
     return (
         ToolRegistry()
         .register(ShellTool(
-            confirm_callback=confirm_callback,
             runtime=runtime,
             boundary=boundary,
+            enforce_confirmation=False,
         ))
         .register(FileReadTool(boundary=boundary))
         .register(FileViewTool(boundary=boundary))

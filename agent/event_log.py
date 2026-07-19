@@ -20,7 +20,7 @@ import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator
 
 from agent.task import Event, EventType, Task, Action, Observation
 
@@ -91,6 +91,25 @@ class EventLog:
                 "step":        step,
                 "action":      action.to_dict(),
                 "raw_content": raw_content,  # 模型原始输出，含完整推理链
+            },
+        ))
+
+    def log_policy_decision(
+        self,
+        step: int,
+        tool_name: str,
+        decision: dict[str, Any],
+        call_id: str | None = None,
+    ) -> None:
+        """工具执行前的策略决策。"""
+        self._append(Event(
+            event_type=EventType.POLICY_DECISION,
+            task_id=self._current_task_id,
+            payload={
+                "step": step,
+                "tool_name": tool_name,
+                "tool_call_id": call_id,
+                "decision": decision,
             },
         ))
 
@@ -282,6 +301,7 @@ def summarize_run(log: EventLog) -> dict:
     stats = {
         "total_events":    len(events),
         "actions":         0,
+        "policy_decisions": 0,
         "reflections":     0,
         "tool_calls":      {},   # tool_name -> count
         "observations_ok": 0,
@@ -299,6 +319,9 @@ def summarize_run(log: EventLog) -> dict:
             for tc in tool_calls:
                 name = tc["name"]
                 stats["tool_calls"][name] = stats["tool_calls"].get(name, 0) + 1
+
+        elif event.event_type == EventType.POLICY_DECISION:
+            stats["policy_decisions"] += 1
 
         elif event.event_type == EventType.OBSERVATION:
             obs = event.payload["observation"]

@@ -256,7 +256,7 @@ class TestToolBoundaryIntegration:
         assert result.success
         assert shlex.split(calls[0]) == ["git", "commit", "-m", message]
 
-    def test_build_registry_injects_confirm_callback_into_shell(self, tmp_path):
+    def test_build_registry_delegates_shell_confirmation_to_policy(self, tmp_path):
         from config.schema import AppConfig
         from entry.cli import _build_registry
 
@@ -265,4 +265,4 @@ class TestToolBoundaryIntegration:
         callback = lambda cmd: False
         registry = _build_registry(AppConfig(), confirm_callback=callback, repo_path=str(root))
 
-        assert registry._tools["shell"]._confirm_callback is callback
+        assert registry._tools["shell"]._enforce_confirmation is False

@@ -204,6 +204,33 @@ class TestToolRegistry:
         assert not result.success
         assert "disk full" in result.error
 
+    def test_prepare_call_validates_without_executing(self):
+        tool = self._make_param_tool()
+        registry = ToolRegistry().register(tool)
+
+        prepared = registry.prepare_call("schema_tool", {"cmd": "pytest"})
+
+        assert prepared.ok
+        assert prepared.tool is tool
+        assert prepared.params == {"cmd": "pytest"}
+        assert tool.call_count == 0
+
+        result = registry.execute_prepared(prepared)
+
+        assert result.success
+        assert tool.call_count == 1
+
+    def test_prepare_call_returns_structured_unknown_tool_error(self):
+        registry = ToolRegistry()
+
+        prepared = registry.prepare_call("missing", {})
+        result = registry.execute_prepared(prepared)
+
+        assert not prepared.ok
+        assert "Unknown tool 'missing'" in prepared.error
+        assert not result.success
+        assert result.error == prepared.error
+
     def test_schema_validation_allows_valid_params(self):
         tool = self._make_param_tool()
         registry = ToolRegistry().register(tool)

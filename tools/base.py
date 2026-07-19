@@ -4,7 +4,7 @@ tools/base.py
 工具层基础设施：
 - ToolResult     工具执行结果
 - BaseTool       所有工具的抽象基类
-- ToolRegistry   工具注册表，core.py 通过它执行工具、生成 schema
+- ToolRegistry   工具注册表，负责查找工具、校验参数、生成 schema
 
 新增工具只需：
     1. 继承 BaseTool，实现 execute() 和 schema 属性
@@ -15,10 +15,14 @@ tools/base.py
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
-from agent.task import Observation, ObservationStatus
+from agent.task import (
+    Observation,
+    ObservationStatus,
+    ToolErrorKind,
+)
 from llm.base import LLMToolSchema
 
 
@@ -30,19 +34,27 @@ from llm.base import LLMToolSchema
 class ToolResult:
     """
     工具执行的原始结果，由各 Tool.execute() 返回。
-    core.py 把它转换为 Observation 后写入 EventLog。
+    Agent 执行管线把它转换为 Observation 后写入 EventLog。
     """
     success: bool
     output: str                         # 工具的文本输出，已做截断处理
     error: str | None = None            # 失败时的错误信息
+    error_kind: ToolErrorKind | None = None
 
     def to_observation(self, tool_name: str) -> Observation:
         """转换为 Observation，供 core.py 写入 EventLog 和注入上下文。"""
+        error_kind = None
+        recovery_hint = None
+        if not self.success:
+            error_kind = self.error_kind or ToolErrorKind.TOOL_ERROR
+            recovery_hint = _default_recovery_hint(error_kind, tool_name)
         return Observation(
             status=ObservationStatus.SUCCESS if self.success else ObservationStatus.ERROR,
             output=self.output,
             tool_name=tool_name,
             error=self.error,
+            error_kind=error_kind,
+            recovery_hint=recovery_hint,
         )
 
 
@@ -102,13 +114,32 @@ class BaseTool(ABC):
 
 
 # ---------------------------------------------------------------------------
+# PreparedToolCall
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class PreparedToolCall:
+    """Tool-call preparation result from the registry."""
+
+    tool_name: str
+    params: dict[str, Any] = field(default_factory=dict)
+    tool: BaseTool | None = None
+    error: str | None = None
+    error_kind: ToolErrorKind | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.tool is not None and self.error is None
+
+
+# ---------------------------------------------------------------------------
 # ToolRegistry
 # ---------------------------------------------------------------------------
 
 class ToolRegistry:
     """
     工具注册表。core.py 持有一个 registry 实例，通过它：
-    1. 查找工具并执行（execute_tool）
+    1. 查找工具并校验参数（prepare_call）
     2. 生成所有工具的 schema 列表注入 LLM（get_schemas）
 
     线程安全：当前 v1 单线程，不加锁。
@@ -127,37 +158,60 @@ class ToolRegistry:
         self._tools[tool.name] = tool
         return self
 
-    def execute_tool(self, name: str, params: Any) -> ToolResult:
+    def prepare_call(self, name: str, params: Any) -> PreparedToolCall:
         """
-        按名称查找工具并执行。
-        工具不存在时返回 error ToolResult（不抛异常，让 agent 继续运行）。
+        按名称查找工具并校验参数，但不执行工具。
+
+        准备失败通过 PreparedToolCall.error 返回，调用方可把它转换为
+        observation，让 agent 继续运行。
         """
         if name not in self._tools:
             available = ", ".join(self._tools.keys()) or "none"
-            return ToolResult(
-                success=False,
-                output="",
+            return PreparedToolCall(
+                tool_name=name,
                 error=f"Unknown tool '{name}'. Available tools: {available}",
+                error_kind=ToolErrorKind.UNKNOWN_TOOL,
             )
 
         tool = self._tools[name]
         validation_error = _validate_params(tool.parameters_schema, params)
         if validation_error:
+            return PreparedToolCall(
+                tool_name=name,
+                error=f"Invalid params for {name}: {validation_error}",
+                error_kind=ToolErrorKind.INVALID_PARAMS,
+            )
+
+        return PreparedToolCall(tool_name=name, params=params, tool=tool)
+
+    def execute_prepared(self, prepared: PreparedToolCall) -> ToolResult:
+        """执行已准备好的工具调用。"""
+        if not prepared.ok or prepared.tool is None:
             return ToolResult(
                 success=False,
                 output="",
-                error=f"Invalid params for {name}: {validation_error}",
+                error=prepared.error or f"Invalid prepared tool call for {prepared.tool_name}",
+                error_kind=prepared.error_kind or ToolErrorKind.INVALID_PARAMS,
             )
 
         try:
-            return tool.execute(params)
+            return prepared.tool.execute(prepared.params)
         except Exception as exc:
             # 工具内部未捕获的异常，降级为 error 结果
             return ToolResult(
                 success=False,
                 output="",
-                error=f"Tool '{name}' raised an unexpected error: {exc}",
+                error=f"Tool '{prepared.tool_name}' raised an unexpected error: {exc}",
+                error_kind=ToolErrorKind.TOOL_EXCEPTION,
             )
+
+    def execute_tool(self, name: str, params: Any) -> ToolResult:
+        """
+        按名称查找工具并执行。
+        工具不存在时返回 error ToolResult（不抛异常，让 agent 继续运行）。
+        """
+        prepared = self.prepare_call(name, params)
+        return self.execute_prepared(prepared)
 
     def get_schemas(self) -> list[LLMToolSchema]:
         """返回所有已注册工具的 schema，供注入 LLM。"""
@@ -175,6 +229,42 @@ class ToolRegistry:
 
     def __repr__(self) -> str:
         return f"ToolRegistry(tools={self.tool_names})"
+
+
+def _default_recovery_hint(
+    kind: ToolErrorKind,
+    tool_name: str,
+) -> str | None:
+    """Return a short next-step hint for common tool failure categories."""
+    hints = {
+        ToolErrorKind.UNKNOWN_TOOL: (
+            "Use one of the registered tool names exactly as provided."
+        ),
+        ToolErrorKind.INVALID_PARAMS: (
+            "Retry with parameters that match the tool schema."
+        ),
+        ToolErrorKind.POLICY_DENIED: (
+            "Do not retry the same action; choose a safer alternative."
+        ),
+        ToolErrorKind.CONFIRMATION_REQUIRED: (
+            "Ask for approval or choose a non-destructive alternative."
+        ),
+        ToolErrorKind.CONFIRMATION_REJECTED: (
+            "Do not retry unless the user explicitly changes the decision."
+        ),
+        ToolErrorKind.TOOL_EXCEPTION: (
+            "Inspect the error and adjust the tool call or environment."
+        ),
+    }
+    if kind in hints:
+        return hints[kind]
+    if kind == ToolErrorKind.TOOL_ERROR:
+        if tool_name == "file_read":
+            return "Check the path or use file_view for a narrower read."
+        if tool_name == "shell":
+            return "Inspect the command output and try a narrower command."
+        return "Inspect the error and adjust the tool call."
+    return None
 
 
 # ---------------------------------------------------------------------------

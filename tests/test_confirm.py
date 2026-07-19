@@ -7,15 +7,15 @@ from __future__ import annotations
 
 import pytest
 
+from tools.shell_safety import check_blocked, is_readonly, needs_confirm
 from tools.shell_tool import (
-    ShellTool, ToolResult,
-    _check_blocked, _is_readonly, _needs_confirm,
+    ShellTool,
     terminal_confirm, always_allow, always_deny,
 )
 
 
 # ===========================================================================
-# _is_readonly — 白名单判断
+# is_readonly — 白名单判断
 # ===========================================================================
 
 class TestIsReadonly:
@@ -35,7 +35,7 @@ class TestIsReadonly:
         "tree .",
     ])
     def test_readonly_commands_pass(self, cmd):
-        assert _is_readonly(cmd), f"Expected {cmd!r} to be readonly"
+        assert is_readonly(cmd), f"Expected {cmd!r} to be readonly"
 
     @pytest.mark.parametrize("cmd", [
         "rm file.py",
@@ -58,19 +58,19 @@ class TestIsReadonly:
         "rg --no-ignore foo .",
     ])
     def test_write_commands_not_readonly(self, cmd):
-        assert not _is_readonly(cmd), f"Expected {cmd!r} to NOT be readonly"
+        assert not is_readonly(cmd), f"Expected {cmd!r} to NOT be readonly"
 
 
 # ===========================================================================
-# _needs_confirm — 确认判断
+# needs_confirm — 确认判断
 # ===========================================================================
 
 class TestNeedsConfirm:
     def test_readonly_does_not_need_confirm(self):
-        assert not _needs_confirm("ls -la")
-        assert not _needs_confirm("cat file.py")
-        assert not _needs_confirm("git status")
-        assert not _needs_confirm("pytest tests/")
+        assert not needs_confirm("ls -la")
+        assert not needs_confirm("cat file.py")
+        assert not needs_confirm("git status")
+        assert not needs_confirm("pytest tests/")
 
     @pytest.mark.parametrize("cmd", [
         "rm file.py",
@@ -96,30 +96,30 @@ class TestNeedsConfirm:
         "rg --no-ignore foo .",
     ])
     def test_dangerous_commands_need_confirm(self, cmd):
-        assert _needs_confirm(cmd), f"Expected {cmd!r} to need confirmation"
+        assert needs_confirm(cmd), f"Expected {cmd!r} to need confirmation"
 
     def test_unknown_command_needs_confirm(self):
-        assert _needs_confirm("python parse_data.py")
-        assert _needs_confirm("node server.js")
+        assert needs_confirm("python parse_data.py")
+        assert needs_confirm("node server.js")
 
 
 # ===========================================================================
-# _check_blocked — 黑名单
+# check_blocked — 黑名单
 # ===========================================================================
 
 class TestCheckBlocked:
     def test_rm_rf_root_blocked(self):
-        assert _check_blocked("rm -rf /") is not None
+        assert check_blocked("rm -rf /") is not None
 
     def test_mkfs_blocked(self):
-        assert _check_blocked("mkfs.ext4 /dev/sda1") is not None
+        assert check_blocked("mkfs.ext4 /dev/sda1") is not None
 
     def test_normal_rm_not_blocked(self):
         # rm 单个文件不在黑名单（会走确认流程）
-        assert _check_blocked("rm file.py") is None
+        assert check_blocked("rm file.py") is None
 
     def test_git_commit_not_blocked(self):
-        assert _check_blocked("git commit -m 'fix'") is None
+        assert check_blocked("git commit -m 'fix'") is None
 
 
 # ===========================================================================
@@ -212,9 +212,9 @@ class TestShellToolConfirm:
     def test_redirect_needs_confirm(self):
         """重定向覆盖（>）需要确认。"""
         # 纯逻辑验证：echo hello > file 不应被判为只读
-        assert not _is_readonly("echo hello > output.txt")
+        assert not is_readonly("echo hello > output.txt")
         # 且需要确认（因为含有 > 重定向）
-        assert _needs_confirm("echo hello > output.txt")
+        assert needs_confirm("echo hello > output.txt")
         # 工具层：callback 拒绝时应返回错误
         denied = []
         tool = ShellTool(confirm_callback=lambda cmd: denied.append(cmd) or False)
@@ -266,8 +266,14 @@ class TestConfirmInAgentFlow:
         ]
         backend = MockBackend(script)
         # always_deny：所有需要确认的命令都拒绝
-        registry = ToolRegistry().register(ShellTool(confirm_callback=always_deny))
-        agent = Agent(backend, registry, AgentConfig(max_steps=5))
+        registry = ToolRegistry().register(
+            ShellTool(enforce_confirmation=False)
+        )
+        agent = Agent(
+            backend,
+            registry,
+            AgentConfig(max_steps=5, confirm_callback=always_deny),
+        )
 
         task = Task(task_id="conf1", description="test", repo_path=str(tmp_path), max_steps=5)
         with EventLog.create(task, log_dir=str(tmp_path / "logs")) as log:
@@ -295,14 +301,61 @@ class TestConfirmInAgentFlow:
             Action(ActionType.FINISH, "done", message="installed"),
         ]
         backend = MockBackend(script)
-        registry = ToolRegistry().register(ShellTool(confirm_callback=always_allow))
-        agent = Agent(backend, registry, AgentConfig(max_steps=5))
+        registry = ToolRegistry().register(
+            ShellTool(enforce_confirmation=False)
+        )
+        agent = Agent(
+            backend,
+            registry,
+            AgentConfig(max_steps=5, confirm_callback=always_allow),
+        )
 
         task = Task(task_id="conf2", description="test", repo_path=str(tmp_path), max_steps=5)
         with EventLog.create(task, log_dir=str(tmp_path / "logs")) as log:
             result = agent.run(task, log)
 
         assert result.is_success()
+
+    def test_agent_shell_policy_confirmation_does_not_call_internal_confirm(self, tmp_path):
+        """Agent 模式下危险 shell 只走 PolicyEngine 确认一次。"""
+        from agent.core import Agent, AgentConfig
+        from agent.event_log import EventLog
+        from agent.task import Action, ActionType, Task, ToolCall
+        from llm.base import MockBackend
+        from tools.base import ToolRegistry
+
+        policy_prompts = []
+        internal_prompts = []
+        script = [
+            Action(
+                ActionType.TOOL_CALL,
+                "run python",
+                ToolCall("shell", {"cmd": "python -c 'print(1)'"}),
+            ),
+            Action(ActionType.FINISH, "done", message="ok"),
+        ]
+        registry = ToolRegistry().register(
+            ShellTool(
+                confirm_callback=lambda cmd: internal_prompts.append(cmd) or True,
+                enforce_confirmation=False,
+            )
+        )
+        agent = Agent(
+            MockBackend(script),
+            registry,
+            AgentConfig(
+                max_steps=5,
+                confirm_callback=lambda prompt: policy_prompts.append(prompt) or True,
+            ),
+        )
+        task = Task(task_id="conf4", description="test", repo_path=str(tmp_path), max_steps=5)
+
+        with EventLog.create(task, log_dir=str(tmp_path / "logs")) as log:
+            result = agent.run(task, log)
+
+        assert result.is_success()
+        assert len(policy_prompts) == 1
+        assert internal_prompts == []
 
     def test_readonly_never_triggers_confirm(self, tmp_path):
         """只读命令不触发 confirm，即使 callback=always_deny。"""

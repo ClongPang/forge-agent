@@ -27,6 +27,7 @@ class EventType(str, Enum):
     """Event log 中的事件类型，str enum 序列化后直接是字符串。"""
     TASK_START      = "task_start"
     ACTION          = "action"
+    POLICY_DECISION = "policy_decision"
     OBSERVATION     = "observation"
     REFLECTION      = "reflection"
     TASK_COMPLETE   = "task_complete"
@@ -46,6 +47,18 @@ class ObservationStatus(str, Enum):
     SUCCESS = "success"
     ERROR   = "error"
     TIMEOUT = "timeout"
+
+
+class ToolErrorKind(str, Enum):
+    """Stable categories for tool-call failures."""
+
+    UNKNOWN_TOOL = "unknown_tool"
+    INVALID_PARAMS = "invalid_params"
+    POLICY_DENIED = "policy_denied"
+    CONFIRMATION_REQUIRED = "confirmation_required"
+    CONFIRMATION_REJECTED = "confirmation_rejected"
+    TOOL_ERROR = "tool_error"
+    TOOL_EXCEPTION = "tool_exception"
 
 
 class RunStatus(str, Enum):
@@ -167,6 +180,8 @@ class Observation:
     tool_name: str                      # 来自哪个工具
     tokens_used: int = 0                # 这条 observation 消耗的 token 数（估算）
     error: str | None = None            # status == ERROR 时的错误信息
+    error_kind: ToolErrorKind | None = None
+    recovery_hint: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -195,6 +210,7 @@ class Event:
     payload 的内容取决于 event_type：
     - TASK_START:    {"task": Task.to_dict()}
     - ACTION:        {"step": int, "action": Action.to_dict()}
+    - POLICY_DECISION: {"step": int, "tool_name": str, "decision": dict}
     - OBSERVATION:   {"step": int, "observation": Observation.to_dict()}
     - REFLECTION:    {"step": int, "reason": str, "prompt": str}
     - TASK_COMPLETE: {"steps": int, "summary": str}

@@ -258,7 +258,6 @@ class ChatSession:
             stream=True,
             stream_callback=_stream_cb,
             thought_callback=_thought_cb,
-            confirm_dangerous=confirm_callback is not None,
             confirm_callback=confirm_callback,
             tracer=self.tracer,
         )

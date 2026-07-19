@@ -42,7 +42,7 @@ forgeagent = "entry.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["agent*", "llm*", "tools*", "context*", "entry*", "config*"]
+include = ["agent*", "llm*", "tools*", "context*", "entry*", "config*", "policy*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -50,5 +50,5 @@ pythonpath = ["."]
 addopts = "-v --tb=short"
 
 [tool.coverage.run]
-source = ["agent", "llm", "tools", "context", "entry"]
+source = ["agent", "llm", "tools", "context", "entry", "policy"]
 omit = ["tests/*"]

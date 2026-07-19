@@ -83,9 +83,9 @@ def _build_registry(cfg, confirm_callback=None, runtime=None, repo_path=None):
     return (
         ToolRegistry()
         .register(ShellTool(
-            confirm_callback=confirm_callback,
             runtime=runtime,
             boundary=boundary,
+            enforce_confirmation=False,
         ))
         .register(FileReadTool(boundary=boundary))
         .register(FileViewTool(boundary=boundary))
@@ -320,7 +320,6 @@ def run(
         stream=stream,
         stream_callback=_stream_cb if stream else None,
         thought_callback=_thought_cb if stream else None,
-        confirm_dangerous=confirm,
         confirm_callback=confirm_cb,
         tracer=tracer,
     )

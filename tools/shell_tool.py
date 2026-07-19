@@ -10,21 +10,25 @@ Shell 命令执行工具。四层防护：
 权限确认设计：
 - confirm_callback 是一个 Callable[[str], bool]，返回 True 表示允许
 - 默认 None 时，只读命令直接执行；需要确认的命令会被拒绝
+- Agent 模式可设置 enforce_confirmation=False，让 PolicyEngine 统一处理确认
 - chat 模式 / 交互模式传入真实的终端确认函数
 - 测试时传入 mock，不需要真实终端
 """
 
 from __future__ import annotations
 
-import re
-import shlex
 from pathlib import Path
 from typing import Any, Callable
 
 from tools.base import BaseTool, ToolResult
 from tools.path_guard import WorkspaceBoundary
 from tools.runtime import LocalRuntime, Runtime
-from tools.security_policy import is_sensitive_path, resolve_repo_path
+from tools.shell_safety import (
+    check_blocked,
+    check_outside_path_references,
+    check_sensitive_path_references,
+    needs_confirm,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -32,41 +36,6 @@ from tools.security_policy import is_sensitive_path, resolve_repo_path
 # ---------------------------------------------------------------------------
 
 MAX_OUTPUT_CHARS = 8_000
-
-# 硬拦截黑名单（永不执行，不问用户）
-_BLOCKED_PATTERNS: tuple[str, ...] = (
-    "rm -rf /",
-    "rm -rf ~",
-    "mkfs",
-    "dd if=",
-    ":(){:|:&};:",       # fork bomb
-    "chmod -R 777 /",
-    "chown -R",
-    "> /dev/sda",
-)
-
-# 只读命令前缀白名单（直接执行，不询问）
-_READONLY_PREFIXES: tuple[str, ...] = (
-    "ls", "ll", "la",
-    "cat", "head", "tail", "less", "more",
-    "echo", "printf",
-    "pwd", "whoami", "which", "type",
-    "find", "locate",
-    "grep", "egrep", "fgrep", "rg", "ag",
-    "wc", "sort", "uniq", "cut", "awk", "sed -n",
-    "diff", "diff3",
-    "file", "stat",
-    "python -m pytest", "python3 -m pytest", "pytest",
-    "git status", "git diff", "git log", "git show",
-    "git branch", "git tag", "git remote",
-    "git stash list",
-    "tree",
-    "ps", "top", "htop",
-    "df", "du",
-    "uname", "hostname",
-    "date", "cal",
-    "man", "help",
-)
 
 # 确认回调类型：接收命令字符串，返回 True=允许 / False=拒绝
 ConfirmCallback = Callable[[str], bool]
@@ -88,6 +57,8 @@ class ShellTool(BaseTool):
     构造参数:
         confirm_callback: 需要确认时调用，返回 True 表示用户允许执行。
                           None 表示拒绝需要确认的命令（run 模式默认）。
+        enforce_confirmation: False 时跳过本工具内部确认，适用于上层
+                              PolicyEngine 已经完成确认的 Agent 模式。
     """
 
     def __init__(
@@ -95,10 +66,12 @@ class ShellTool(BaseTool):
         confirm_callback: ConfirmCallback | None = None,
         runtime: Runtime | None = None,
         boundary: WorkspaceBoundary | None = None,
+        enforce_confirmation: bool = True,
     ) -> None:
         self._confirm_callback = confirm_callback
         self._boundary = boundary
         self._runtime = runtime or LocalRuntime(boundary=boundary)
+        self._enforce_confirmation = enforce_confirmation
 
     @property
     def name(self) -> str:
@@ -142,7 +115,7 @@ class ShellTool(BaseTool):
             return ToolResult(success=False, output="", error="cmd is required")
 
         # 层 1：黑名单硬拦截
-        blocked = _check_blocked(cmd)
+        blocked = check_blocked(cmd)
         if blocked:
             return ToolResult(
                 success=False,
@@ -150,19 +123,27 @@ class ShellTool(BaseTool):
                 error=f"Command blocked for safety: matched '{blocked}'",
             )
 
-        outside_error = _check_outside_path_references(cmd, self._boundary)
+        outside_error = check_outside_path_references(cmd, self._boundary)
         if outside_error:
             return ToolResult(success=False, output="", error=outside_error)
 
-        sensitive_error = _check_sensitive_path_references(cmd, self._boundary, cwd)
+        repo_root = (
+            self._boundary.root
+            if self._boundary is not None
+            else Path(cwd or Path.cwd()).resolve(strict=False)
+        )
+        sensitive_error = check_sensitive_path_references(cmd, repo_root, cwd)
         if sensitive_error:
             return ToolResult(success=False, output="", error=sensitive_error)
 
         # 层 2：白名单免确认
-        if not _needs_confirm(cmd):
+        if not needs_confirm(cmd):
             return self._run(cmd, timeout, cwd)
 
         # 层 3：权限确认
+        if not self._enforce_confirmation:
+            return self._run(cmd, timeout, cwd)
+
         if self._confirm_callback is not None:
             allowed = self._confirm_callback(cmd)
             if not allowed:
@@ -197,177 +178,6 @@ class ShellTool(BaseTool):
         else:
             error = None
         return ToolResult(success=result.success, output=output, error=error)
-
-
-# ---------------------------------------------------------------------------
-# 辅助函数（对外暴露供测试）
-# ---------------------------------------------------------------------------
-
-def _check_blocked(cmd: str) -> str | None:
-    """返回匹配到的黑名单 pattern，没有匹配返回 None。"""
-    cmd_lower = cmd.lower()
-    for pattern in _BLOCKED_PATTERNS:
-        if pattern.lower() in cmd_lower:
-            return pattern
-    return None
-
-
-def _is_readonly(cmd: str) -> bool:
-    """
-    判断命令是否在只读白名单里。
-    包含 > 写重定向的命令不算只读（即使命令名在白名单里）。
-    """
-    import re as _re
-    if _has_shell_metachar(cmd):
-        return False
-    stripped = cmd.strip().lower()
-    try:
-        tokens = shlex.split(stripped, posix=True)
-    except ValueError:
-        return False
-    if _uses_recursive_grep(tokens) or _uses_rg_ignore_bypass(tokens):
-        return False
-    if stripped.startswith("find ") and _re.search(r"\s-(exec|delete)\b", stripped):
-        return False
-    for prefix in _READONLY_PREFIXES:
-        if stripped == prefix or stripped.startswith(prefix + " "):
-            return True
-    return False
-
-
-def _needs_confirm(cmd: str) -> bool:
-    """
-    判断命令是否需要用户确认。
-    只有严格只读白名单命令免确认，其余命令都需要确认。
-    """
-    return not _is_readonly(cmd)
-
-
-def _has_shell_metachar(cmd: str) -> bool:
-    """Return True if a command uses shell syntax that can hide side effects."""
-    return bool(re.search(r"(\|\||&&|[|;<>`]\s*|\$\(|\$\{?[A-Za-z_][A-Za-z0-9_]*\}?)", cmd))
-
-
-def _uses_recursive_grep(tokens: list[str]) -> bool:
-    """Recursive grep can read ignored secrets; use search_text for repo search."""
-    if not tokens or tokens[0] not in {"grep", "egrep", "fgrep"}:
-        return False
-    for token in tokens[1:]:
-        if token in {"--recursive", "--dereference-recursive"}:
-            return True
-        if token.startswith("--"):
-            continue
-        if token.startswith("-") and any(flag in token[1:] for flag in ("r", "R")):
-            return True
-    return False
-
-
-def _uses_rg_ignore_bypass(tokens: list[str]) -> bool:
-    """Reject rg/ag flags that bypass hidden-file or ignore-file protections."""
-    if not tokens or tokens[0] not in {"rg", "ag"}:
-        return False
-    for token in tokens[1:]:
-        if token in {"--hidden", "--no-ignore", "--no-ignore-vcs", "--no-ignore-parent"}:
-            return True
-        if token.startswith("--no-ignore") or token.startswith("-u"):
-            return True
-    return False
-
-
-_PATH_CANDIDATE_RE = re.compile(
-    r"(?<![\w:])(/[^ \t\r\n'\";|&<>]+|(?:\.\./)[^ \t\r\n'\";|&<>]+)"
-)
-
-
-def _check_outside_path_references(
-    cmd: str,
-    boundary: WorkspaceBoundary | None,
-) -> str | None:
-    """Best-effort confirmation for explicit paths outside the workspace."""
-    if boundary is None:
-        return None
-
-    for candidate in _extract_path_candidates(cmd):
-        check = boundary.resolve(
-            candidate,
-            operation=f"shell command references {candidate!r}",
-        )
-        if not check.success:
-            return check.error
-    return None
-
-
-def _extract_path_candidates(cmd: str) -> list[str]:
-    """Extract absolute and parent-traversal path references from a shell string."""
-    candidates: set[str] = set()
-
-    try:
-        tokens = shlex.split(cmd, posix=True)
-    except ValueError:
-        tokens = []
-
-    for token in tokens:
-        parts = [token]
-        if "=" in token:
-            parts.append(token.split("=", 1)[1])
-        for part in parts:
-            cleaned = part.strip()
-            if cleaned.startswith(("/", "../")) or cleaned in {".."}:
-                candidates.add(cleaned)
-
-    candidates.update(m.group(1) for m in _PATH_CANDIDATE_RE.finditer(cmd))
-    return sorted(candidates)
-
-
-def _check_sensitive_path_references(
-    cmd: str,
-    boundary: WorkspaceBoundary | None,
-    cwd: str | None = None,
-) -> str | None:
-    """Reject shell commands that explicitly reference sensitive repo files."""
-    repo_root = boundary.root if boundary is not None else Path(cwd or Path.cwd()).resolve(strict=False)
-    base = Path(cwd).resolve(strict=False) if cwd else repo_root
-
-    for candidate in _extract_sensitive_path_candidates(cmd):
-        path = resolve_repo_path(candidate, repo_root, base=base)
-        if is_sensitive_path(path, repo_root=repo_root):
-            return f"Sensitive file reference rejected: {path}"
-    return None
-
-
-def _extract_sensitive_path_candidates(cmd: str) -> list[str]:
-    """Extract explicit path-like arguments that could target sensitive files."""
-    try:
-        tokens = shlex.split(cmd, posix=True)
-    except ValueError:
-        return []
-
-    candidates: set[str] = set()
-    for token in tokens[1:]:
-        values = [token]
-        if "=" in token:
-            values.append(token.split("=", 1)[1])
-        for value in values:
-            cleaned = value.strip()
-            if not cleaned or cleaned.startswith("-"):
-                continue
-            if _looks_like_sensitive_path_arg(cleaned):
-                candidates.add(cleaned)
-    return sorted(candidates)
-
-
-def _looks_like_sensitive_path_arg(value: str) -> bool:
-    """Return True for path arguments worth checking against sensitive patterns."""
-    name = Path(value).name
-    return (
-        value.startswith(("/", "./", "../", ".git/", "logs/"))
-        or "/" in value
-        or name == ".env"
-        or name.startswith(".env.")
-        or name.endswith((".pem", ".key"))
-        or name.startswith("id_rsa")
-        or name == ".git-credentials"
-    )
 
 
 def _truncate(text: str, max_chars: int) -> str:

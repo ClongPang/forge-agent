@@ -744,7 +744,7 @@ class TestCoreWithContext:
         tool_messages = [m for m in second_messages if m.role == "tool"]
         assert [m.tool_call_id for m in tool_messages] == ["call_1", "call_2"]
         assert "Status: SUCCESS" in tool_messages[0].content
-        assert "Action requires confirmation" in tool_messages[1].content
+        assert "Unknown tool 'git_commit'" in tool_messages[1].content
 
     def test_multiple_tool_calls_trigger_test_reflection_once(self, tmp_path):
         from agent.core import Agent, AgentConfig
