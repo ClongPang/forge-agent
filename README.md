@@ -82,6 +82,9 @@ forgeagent run --repo . --task "run the test suite and fix failures" --sandbox
 # 显式验证，并在验证失败或未验证时返回非零退出码
 forgeagent run --repo . --task "fix the failing tests" \
     --verify "pytest" --fail-on-unverified
+
+# 本地 Core Benchmark：自动跑一组 run-mode 回归样例
+forgeagent eval run-core
 ```
 
 每次 `run` 都会生成事件日志和 artifact 目录：
@@ -152,6 +155,27 @@ forgeagent eval add-trace TRACE_OR_URL --dataset forge-agent/regression
 ```
 
 用于把失败 trace 沉淀为后续回归样本。
+
+### Local Core Benchmark
+
+```bash
+forgeagent eval run-core
+forgeagent eval run-core --case basic_python_fix --case inspect_readonly
+forgeagent eval run-core --list-cases
+```
+
+该入口会创建临时样例仓库，调用现有 `run` 命令，并根据 `report.json`
+检查退出码、verification、permission mode、changed files 和 artifact。
+
+内置 case 可以单独启动：
+
+```bash
+forgeagent eval run-core --case basic_python_fix
+forgeagent eval run-core --case multi_file_python_fix
+forgeagent eval run-core --case inspect_readonly
+forgeagent eval run-core --case fail_on_unverified
+forgeagent eval run-core --case verification_guard
+```
 
 ---
 

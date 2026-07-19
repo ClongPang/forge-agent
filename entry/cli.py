@@ -219,8 +219,8 @@ def cli(ctx: click.Context, config: str | None) -> None:
 @click.option("--model", "-m", default=None, help="Override LLM model name")
 @click.option("--provider", "-p", default=None, help="Override LLM provider")
 @click.option(
-    "--mode", "--permission-mode",
-    "permission_mode",
+    "--mode", "--permission-mode", # 两种命令行参数
+    "permission_mode", # 传递赋值的变量名
     default="fix",
     show_default=True,
     type=click.Choice(["inspect", "fix", "maintain"]),
@@ -649,6 +649,126 @@ def chat(
 @cli.group("eval")
 def eval_cmd() -> None:
     """Manage experimental evaluation datasets."""
+
+
+@eval_cmd.command("run-core")
+@click.option(
+    "--case",
+    "case_ids",
+    multiple=True,
+    help="Run only selected case ids; repeatable and comma/space separated.",
+)
+@click.option("--limit", default=None, type=int, help="Limit selected cases.")
+@click.option(
+    "--work-dir",
+    default="runs/core-eval",
+    show_default=True,
+    help="Directory for disposable repos and the benchmark summary.",
+)
+@click.option(
+    "--output",
+    default=None,
+    type=click.Path(dir_okay=False, path_type=Path),
+    help="Write summary JSON to this path; defaults inside --work-dir.",
+)
+@click.option("--provider", "-p", default=None, help="Override LLM provider.")
+@click.option("--model", "-m", default=None, help="Override LLM model.")
+@click.option("--max-steps", default=None, type=int, help="Override agent max steps.")
+@click.option(
+    "--verify-timeout",
+    default=300,
+    show_default=True,
+    type=int,
+    help="Timeout in seconds for each case verification command.",
+)
+@click.option(
+    "--case-timeout",
+    default=900,
+    show_default=True,
+    type=int,
+    help="Wall-clock timeout in seconds for each case run.",
+)
+@click.option("--fail-fast", is_flag=True, help="Stop after the first failed case.")
+@click.option("--list-cases", is_flag=True, help="List built-in core cases and exit.")
+@click.pass_context
+def eval_run_core(
+    ctx: click.Context,
+    case_ids: tuple[str, ...],
+    limit: int | None,
+    work_dir: str,
+    output: Path | None,
+    provider: str | None,
+    model: str | None,
+    max_steps: int | None,
+    verify_timeout: int,
+    case_timeout: int,
+    fail_fast: bool,
+    list_cases: bool,
+) -> None:
+    """Run the local core benchmark suite against `run` mode."""
+    from agent.core_benchmark import default_core_cases, run_core_benchmark
+
+    if list_cases:
+        click.echo(bold("Core benchmark cases"))
+        for case in default_core_cases():
+            click.echo(f"  {case.id:<24} {case.mode:<8} {case.name}")
+        return
+
+    click.echo(bold("\nForge Agent Core Benchmark"))
+    click.echo(f"  Work dir : {Path(work_dir).resolve()}")
+    if case_ids:
+        click.echo(f"  Cases    : {', '.join(case_ids)}")
+    elif limit is not None:
+        click.echo(f"  Cases    : first {limit}")
+    else:
+        click.echo("  Cases    : built-in suite")
+    click.echo()
+
+    try:
+        result = run_core_benchmark(
+            work_dir=work_dir,
+            output_path=output,
+            case_ids=case_ids,
+            limit=limit,
+            config_path=ctx.obj.get("config_path"),
+            provider=provider,
+            model=model,
+            max_steps=max_steps,
+            verify_timeout=verify_timeout,
+            case_timeout=case_timeout,
+            fail_fast=fail_fast,
+        )
+    except ValueError as exc:
+        click.echo(red(f"Error: {exc}"), err=True)
+        sys.exit(1)
+    except Exception as exc:
+        click.echo(red(f"Error: core benchmark failed: {exc}"), err=True)
+        sys.exit(1)
+
+    for case_result in result.cases:
+        label = green("PASS") if case_result.passed else red("FAIL")
+        click.echo(
+            f"[{label}] {case_result.case_id} "
+            f"exit={case_result.exit_code} "
+            f"verify={case_result.verification_status or '-'} "
+            f"changed={case_result.changed_files}"
+        )
+        if not case_result.passed:
+            for failure in case_result.failures:
+                click.echo(red(f"  - {failure}"))
+            if case_result.report_path:
+                click.echo(dim(f"  report: {case_result.report_path}"))
+            elif case_result.stderr_tail:
+                last_error = case_result.stderr_tail.strip().splitlines()[-1]
+                click.echo(dim(f"  stderr: {last_error[:220]}"))
+
+    click.echo()
+    click.echo(bold("Summary"))
+    click.echo(f"  Passed : {result.passed}/{result.total}")
+    click.echo(f"  Failed : {result.failed}")
+    click.echo(f"  Output : {result.summary_path}")
+
+    sys.exit(0 if result.success else 1)
 
 
 @eval_cmd.command("add-trace")

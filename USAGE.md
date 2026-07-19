@@ -487,6 +487,45 @@ python -m entry.github_issue \
 
 该入口属于工作流集成。建议在临时 checkout 或受控仓库里使用。
 
+### Local Core Benchmark
+
+```bash
+forgeagent eval run-core
+forgeagent eval run-core --list-cases
+forgeagent eval run-core \
+  --case basic_python_fix \
+  --case inspect_readonly \
+  --output runs/core-eval/summary.json
+```
+
+该入口用于日常 agent 开发迭代。它会自动创建一组小型临时 git 仓库，
+逐个调用现有 `run` 命令，然后读取 `report.json` 校验：
+
+- 进程退出码
+- permission mode
+- verification 状态
+- 是否产生预期 patch
+- 实际 changed files 是否符合预期
+
+默认内置 case 覆盖基础修复、多文件定位、inspect 只读、
+`--fail-on-unverified` 退出码，以及 verification 命令安全边界。
+
+单独启动每个内置 case：
+
+```bash
+forgeagent eval run-core --case basic_python_fix
+forgeagent eval run-core --case multi_file_python_fix
+forgeagent eval run-core --case inspect_readonly
+forgeagent eval run-core --case fail_on_unverified
+forgeagent eval run-core --case verification_guard
+```
+
+使用源码入口等价写法：
+
+```bash
+.venv/bin/python -m entry.cli eval run-core --case basic_python_fix
+```
+
 ### SWE-bench Predictions
 
 ```bash
@@ -665,6 +704,8 @@ forgeagent log show logs/xxx.jsonl
 forgeagent chat --repo .
 
 # 高级/实验
+forgeagent eval run-core
+forgeagent eval run-core --case basic_python_fix --output runs/core-eval/summary.json
 python -m entry.github_issue -r owner/repo -i 42 -l /tmp/repo --no-pr
 python -m entry.swebench generate --split dev --limit 1 --output predictions.jsonl
 forgeagent eval add-trace TRACE_OR_URL

@@ -9,6 +9,30 @@
 
 评测不要求你提前准备真实业务仓库。下面会在 `/tmp/forge-agent-eval` 下创建临时样例仓库。
 
+## 自动化入口
+
+日常开发迭代优先使用本地 Core Benchmark：
+
+```bash
+cd /Users/pclong/projects_dev/forge-agent
+.venv/bin/python -m entry.cli eval run-core
+```
+
+常用变体：
+
+```bash
+.venv/bin/python -m entry.cli eval run-core --list-cases
+.venv/bin/python -m entry.cli eval run-core --case basic_python_fix
+.venv/bin/python -m entry.cli eval run-core \
+  --case basic_python_fix \
+  --case inspect_readonly \
+  --output runs/core-eval/summary.json
+```
+
+该命令会自动创建临时样例仓库、调用现有 `run` 命令、读取每次运行的
+`report.json`，并输出一份 benchmark summary JSON。下面的手动步骤仍然
+适合排查某个 case 的具体失败原因。
+
 ## 0. 评测原则
 
 这份评测分成两类：
